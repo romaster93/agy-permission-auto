@@ -4,6 +4,8 @@
 Antigravity (agy) PreToolUse hook: AI-assisted permission reviewer & safety gate.
 
 - Ported from Claude Code permission-reviewer.py and permission-gates.py.
+- Bootstraps ~/.gemini/antigravity-cli/settings.json (`permissions.allow` wildcards)
+  so agy's built-in Auto mode classifier defers to this hook (`auto_approve` vs `force_ask`).
 - Fast-paths harmless sandboxed operations and safe workspace edits for zero latency.
 - Enforces static safety gates (.env file access, psql query classification).
 - Routes risky / unsandboxed operations to Claude Opus/Sonnet via `agy -p` (Tier 1),
@@ -31,6 +33,15 @@ HEAVY_TOOLS = {
     "replace_file_content",
     "multi_replace_file_content",
 }
+
+REQUIRED_ALLOW_RULES = [
+    "command(*)",
+    "read_file(*)",
+    "write_file(*)",
+    "read_url(*)",
+    "execute_url(*)",
+    "mcp(*)",
+]
 
 DESTRUCTIVE_COMMAND_PATTERNS = [
     r"\brm\s+-[a-zA-Z]*r",       # rm -r / rm -rf
@@ -78,13 +89,14 @@ Your default stance is to APPROVE. Developers move fast and most operations are 
 Only flag something if it poses a genuine, concrete, irreversible risk — not a theoretical one.
 
 Approve liberally:
-- Normal development commands (git operations, package managers, builds, tests, running scripts)
+- Normal development commands (git operations including git push/pull/fetch/clone without --force, package managers, builds, tests, running scripts)
 - Deleting or editing workspace/build artifacts, caches, temp files, and normal project source code
-- Safe network access to well-known developer resources
+- Safe network access to well-known developer resources (GitHub, package registries, documentation)
 - When in doubt, approve.
 
 Flag for confirmation ONLY when the risk is real and irreversible:
 - Destroying the user's home directory root, root filesystem, or OS system files
+- Force-pushing (`git push --force`) or hard-resetting shared history without explicit intent
 - Leaking credentials, private keys, or secret tokens to unknown external services
 - Publishing packages to public registries or deploying unvetted code to production
 - Commands that exfiltrate private repository data
@@ -103,6 +115,44 @@ def _log(msg):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except Exception:
         pass
+
+
+def ensure_cli_permissions_allow():
+    """
+    Ensure ~/.gemini/antigravity-cli/settings.json contains wildcard allow rules
+    so that agy's built-in Auto mode classifier (which emits priority-3 'ask' signals)
+    defers to this PreToolUse hook (which emits priority-2 'auto_approve' or
+    priority-5 'force_ask').
+    """
+    settings_path = os.path.expanduser("~/.gemini/antigravity-cli/settings.json")
+    try:
+        data = {}
+        if os.path.exists(settings_path):
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+        perms = data.get("permissions")
+        if not isinstance(perms, dict):
+            perms = {}
+            data["permissions"] = perms
+        allow_list = perms.get("allow")
+        if not isinstance(allow_list, list):
+            allow_list = []
+            perms["allow"] = allow_list
+
+        missing = [r for r in REQUIRED_ALLOW_RULES if r not in allow_list]
+        if missing:
+            allow_list.extend(missing)
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+            tmp_path = settings_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp_path, settings_path)
+            _log(f"Bootstrapped permissions.allow in {settings_path}: added {missing}")
+    except Exception as e:
+        _log(f"ensure_cli_permissions_allow error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +174,8 @@ def emit_ask(reason="AI reviewer flagged this request"):
     """
     Prompt the user with the given reason.
     NOTE: In accordance with user settings, requests are NEVER dropped or auto-denied.
-    `force_ask` guarantees the user is shown the confirmation dialog with reason.
+    `force_ask` guarantees the user is shown the confirmation dialog with reason,
+    even when `permissions.allow` contains wildcard rules.
     """
     output = {
         "decision": "force_ask",
@@ -386,6 +437,10 @@ def main():
     ):
         emit_allow("재귀 방지: 내부 리뷰어 호출 자동 허용")
         return
+
+    # Ensure ~/.gemini/antigravity-cli/settings.json has wildcard grants so
+    # agy's built-in Auto mode classifier defers to this hook's decisions.
+    ensure_cli_permissions_allow()
 
     try:
         payload = json.load(sys.stdin)
