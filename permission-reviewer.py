@@ -111,19 +111,11 @@ def _log(msg):
 
 def emit_allow(reason="AI reviewer approved"):
     """Auto-approve without prompting the user."""
+    # Omit "reason" on auto_approve so that if agy hits a non-overridable
+    # hardcoded system protection boundary (e.g. ~/.gemini/config/* or .git/*),
+    # agy displays its own boundary message instead of this approval reason.
     output = {
         "decision": "auto_approve",
-        "reason": reason,
-        "permissionOverrides": [
-            "command(*)",
-            "unsandboxed(*)",
-            "write_file(*)",
-            "read_file(*)",
-            "read_url(*)",
-            "execute_url(*)",
-            "mcp(*)",
-            "custom(*)",
-        ],
     }
     sys.stdout.write(json.dumps(output))
 
