@@ -1,0 +1,5 @@
+{
+  "name": "permission-reviewer",
+  "description": "AI-assisted permissive permission reviewer and safety gate for Antigravity (agy). Auto-judges edge cases with Claude Opus/Sonnet, fast-paths safe operations, and enforces .env and psql gates. Never auto-drops.",
+  "version": "1.0.0"
+}
