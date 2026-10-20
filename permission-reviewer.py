@@ -291,125 +291,180 @@ def classify_sql(sql):
 # AI Model Reviewer (3-Tier Fallback: agy Opus/Sonnet -> agy Default -> claude)
 # ---------------------------------------------------------------------------
 
-def _parse_llm_json(raw_output):
-    """Extract {"ok": ...} JSON object from model stdout."""
-    if not raw_output:
+def _extract_decision(text):
+    """Find the last balanced {...} span that parses as JSON with an 'ok' key."""
+    if not text:
         return None
-    text = raw_output.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    m = re.search(r"\{.*?\}", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        parsed = json.loads(m.group(0))
-        if isinstance(parsed, dict) and "ok" in parsed:
-            return parsed
-    except Exception:
-        pass
+    candidates = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(text[start : i + 1])
+                    start = -1
+    for cand in reversed(candidates):
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict) and "ok" in obj:
+                return obj
+        except Exception:
+            continue
     return None
 
 
-def _build_clean_env():
-    env = os.environ.copy()
-    env["AGY_PERMISSION_REVIEWER_ACTIVE"] = "1"
-    env["CLAUDE_PERMISSION_REVIEWER_ACTIVE"] = "1"
-    depth = int(env.get("AGY_PERMISSION_REVIEWER_DEPTH", "0"))
-    env["AGY_PERMISSION_REVIEWER_DEPTH"] = str(depth + 1)
-    env["CLAUDE_PERMISSION_REVIEWER_DEPTH"] = str(depth + 1)
-    return env
-
-
-def _try_agy_cli(prompt_text, model=None, timeout=18):
+def _run_agy_print(prompt, env, model=None, timeout_sec=25):
+    """
+    Invoke `agy` in headless print mode.
+    IMPORTANT: `-p` must immediately precede `prompt` (`-p <prompt>`),
+    and `stdin` must be `DEVNULL` so `agy` does not read from the hook's stdin pipe.
+    """
     agy_bin = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
-    if not os.path.exists(agy_bin):
-        return None
-
-    cmd = [agy_bin, "-p", prompt_text, "--output-format", "text"]
+    cmd = [
+        agy_bin,
+        "--disable-slash-commands",
+        "--print-timeout", "20s",
+    ]
     if model:
         cmd.extend(["--model", model])
-
-    try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=_build_clean_env(),
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-            cwd="/tmp",
-        )
-        if res.returncode == 0 and res.stdout:
-            return _parse_llm_json(res.stdout)
-        _log(f"agy (model={model}) non-zero or empty: rc={res.returncode} stderr={res.stderr[:200]}")
-    except Exception as e:
-        _log(f"agy (model={model}) exception: {e}")
-    return None
+    cmd.extend(["-p", prompt])
+    return subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+        env=env,
+    )
 
 
-def _try_claude_cli(prompt_text, model="sonnet", timeout=18):
-    claude_bin = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-    if not os.path.exists(claude_bin):
+def _pick_fallback_claude_from_stderr(stderr_text, want_opus=True):
+    """If agy prints 'available models: ...', find a matching Claude model slug."""
+    m = re.search(r"available models:\s*(.+)", stderr_text, re.IGNORECASE)
+    if not m:
         return None
-
-    cmd = [
-        claude_bin,
-        "-p",
-        "--model", model,
-        "--output-format", "text",
-        "--no-session-persistence",
-        "--permission-mode", "ReadOnly",
-        "--system-prompt", SYSTEM_PROMPT,
-        prompt_text,
-    ]
-    try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=_build_clean_env(),
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-            cwd="/tmp",
-        )
-        if res.returncode == 0 and res.stdout:
-            return _parse_llm_json(res.stdout)
-        _log(f"claude (model={model}) non-zero or empty: rc={res.returncode} stderr={res.stderr[:200]}")
-    except Exception as e:
-        _log(f"claude (model={model}) exception: {e}")
+    models = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    target = "opus" if want_opus else "sonnet"
+    for mod in models:
+        if target in mod.lower():
+            return mod
+    for mod in models:
+        if "claude" in mod.lower():
+            return mod
     return None
 
 
-def call_llm_reviewer(request_summary, tool_name):
+def call_llm_reviewer(request_info, tool_name):
     """
-    Tier 1: `agy -p` with Claude Opus 4.6 (for heavy tools) or Claude Sonnet 4.6 (for lighter tools)
-    Tier 2: `agy -p` with default model (if Claude quota/rate limit is reached)
-    Tier 3: `claude -p` (if agy CLI fails or is unavailable)
-    Fallback: Returns {"ok": False, "reason": ...} -> triggers `force_ask` (never auto-deny).
+    Tier 1: `agy --model claude-opus-5-5 -p ...` (or `claude-sonnet-5-5`)
+    Tier 2: `agy -p ...` (default active model in agy, e.g. Gemini)
+    Tier 3: `claude -p --model opus|sonnet ...`
+    Tier 4: fallback to asking the user (never drop!)
     """
-    full_prompt = f"{SYSTEM_PROMPT}\n\n[Request under review]\n{request_summary}"
-    primary_agy_model = "claude-opus-4-6" if tool_name in HEAVY_TOOLS else "claude-sonnet-4-6"
+    is_heavy = tool_name in HEAVY_TOOLS
+    agy_claude_model = "claude-opus-5-5" if is_heavy else "claude-sonnet-5-5"
+    claude_cli_model = "opus" if is_heavy else "sonnet"
 
-    # Tier 1: agy with target Claude model
-    result = _try_agy_cli(full_prompt, model=primary_agy_model)
-    if result is not None:
-        _log(f"Tier 1 (agy {primary_agy_model}) decision for {tool_name}: {result}")
-        return result
+    env = os.environ.copy()
+    current_depth = int(os.environ.get("AGY_PERMISSION_REVIEWER_DEPTH", "0"))
+    env["AGY_PERMISSION_REVIEWER_ACTIVE"] = "1"
+    env["CLAUDE_PERMISSION_REVIEWER_ACTIVE"] = "1"
+    env["AGY_PERMISSION_REVIEWER_DEPTH"] = str(current_depth + 1)
+    env["CLAUDE_PERMISSION_REVIEWER_DEPTH"] = str(current_depth + 1)
 
-    # Tier 2: agy with default model (e.g. Gemini 3.1 Pro when Claude quota is exhausted)
-    result = _try_agy_cli(full_prompt, model=None)
-    if result is not None:
-        _log(f"Tier 2 (agy default) decision for {tool_name}: {result}")
-        return result
+    full_prompt = (
+        SYSTEM_PROMPT
+        + "\n\nReview this request and respond ONLY with JSON {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}:\n\n"
+        + request_info
+    )
 
-    # Tier 3: claude CLI fallback
-    claude_model = "opus" if tool_name in HEAVY_TOOLS else "sonnet"
-    result = _try_claude_cli(request_summary, model=claude_model)
-    if result is not None:
-        _log(f"Tier 3 (claude {claude_model}) decision for {tool_name}: {result}")
-        return result
+    # -----------------------------------------------------------------------
+    # Tier 1: agy -p with Claude model (claude-opus-5-5 / claude-sonnet-5-5)
+    # -----------------------------------------------------------------------
+    try:
+        result = _run_agy_print(full_prompt, env, model=agy_claude_model)
+        if result.returncode == 0 and result.stdout.strip():
+            dec = _extract_decision(result.stdout)
+            if dec is not None:
+                _log(f"Tier 1 ({agy_claude_model}) succeeded: {dec}")
+                return dec
+        else:
+            _log(f"Tier 1 ({agy_claude_model}) rc={result.returncode} stderr={result.stderr.strip()[:200]}")
+            alt_model = _pick_fallback_claude_from_stderr(result.stderr, want_opus=is_heavy)
+            if alt_model and alt_model != agy_claude_model:
+                result2 = _run_agy_print(full_prompt, env, model=alt_model)
+                if result2.returncode == 0 and result2.stdout.strip():
+                    dec = _extract_decision(result2.stdout)
+                    if dec is not None:
+                        _log(f"Tier 1b ({alt_model}) succeeded: {dec}")
+                        return dec
+    except Exception as e:
+        _log(f"Tier 1 exception: {e}")
 
-    _log(f"All AI reviewer tiers failed for {tool_name}; falling back to force_ask.")
+    # -----------------------------------------------------------------------
+    # Tier 2: agy -p with default active model (no --model flag)
+    # -----------------------------------------------------------------------
+    try:
+        result = _run_agy_print(full_prompt, env, model=None)
+        if result.returncode == 0 and result.stdout.strip():
+            dec = _extract_decision(result.stdout)
+            if dec is not None:
+                _log(f"Tier 2 (agy default) succeeded: {dec}")
+                return dec
+        else:
+            _log(f"Tier 2 (agy default) rc={result.returncode} stderr={result.stderr.strip()[:200]}")
+    except Exception as e:
+        _log(f"Tier 2 exception: {e}")
+
+    # -----------------------------------------------------------------------
+    # Tier 3: claude -p with Opus/Sonnet
+    # -----------------------------------------------------------------------
+    try:
+        claude_bin = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+        claude_cmd = [
+            claude_bin,
+            "-p",
+            "--output-format", "json",
+            "--model", claude_cli_model,
+            "--no-session-persistence",
+            "--append-system-prompt", SYSTEM_PROMPT,
+            "Review this request:\n\n" + request_info,
+        ]
+        result = subprocess.run(
+            claude_cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=env,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                resp = json.loads(result.stdout)
+                text = resp.get("result", "")
+                dec = _extract_decision(text)
+                if dec is not None:
+                    _log(f"Tier 3 (claude {claude_cli_model}) succeeded: {dec}")
+                    return dec
+            except Exception:
+                dec = _extract_decision(result.stdout)
+                if dec is not None:
+                    _log(f"Tier 3 (claude raw) succeeded: {dec}")
+                    return dec
+        else:
+            _log(f"Tier 3 (claude) rc={result.returncode} stderr={result.stderr.strip()[:200]}")
+    except Exception as e:
+        _log(f"Tier 3 exception: {e}")
+
+    # -----------------------------------------------------------------------
+    # Tier 4: All failed or quota 0 -> ask user, never drop
+    # -----------------------------------------------------------------------
     return {
         "ok": False,
         "reason": "AI 리뷰어 응답 없음 또는 사용량 소진 — 수동 확인이 필요합니다.",
