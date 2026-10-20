@@ -64,19 +64,23 @@ REQUIRED_ALLOW_RULES = [
 ]
 
 DESTRUCTIVE_COMMAND_PATTERNS = [
-    r"\brm\s+-[a-zA-Z]*r",       # rm -r / rm -rf
+    r"\brm\b.*(\s-[a-zA-Z]*[rf]|\s--recursive|\s--force)",  # rm -r / rm -f / rm -rf
     r"\brmdir\b",
+    r"\bshred\b",
+    r"\btruncate\b",
     r"\bmkfs\b",
     r"\bdd\s+if=",
-    r"\bchmod\s+-[a-zA-Z]*R",    # chmod -R
-    r"\bchown\s+-[a-zA-Z]*R",    # chown -R
-    r"\bgit\s+push\b.*(--force|-f\b)",
-    r"\bgit\s+reset\s+--hard",
-    r"\bgit\s+clean\s+-[a-zA-Z]*f",
-    r"\bcurl\b.*\|\s*(ba|z)?sh",
-    r"\bwget\b.*\|\s*(ba|z)?sh",
+    r"\bchmod\b.*(\s-[a-zA-Z]*R|\s--recursive|\s777\b)",    # chmod -R / chmod 777
+    r"\bchown\b.*(\s-[a-zA-Z]*R|\s--recursive)",            # chown -R
+    r"\bgit\b.*\bpush\b.*(--force|-f\b)",                   # git push --force (including git -C ... push --force)
+    r"\bgit\b.*\breset\b.*--hard",                          # git reset --hard
+    r"\bgit\b.*\bclean\b.*(-[a-zA-Z]*f|--force)",           # git clean -f / -fd
+    r"\bgit\b.*\bbranch\b.*-D\b",                           # git branch -D
+    r"\b(curl|wget)\b.*\|\s*(ba|z|da|k)?sh\b",              # curl/wget | sh/bash
+    r"\bsudo\b",
     r"\bkill\s+-9\b",
     r"\bpkill\b",
+    r"\bkillall\b",
     r"\bsystemctl\b",
     r"\breboot\b",
     r"\bshutdown\b",
