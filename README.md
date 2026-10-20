@@ -29,9 +29,11 @@ git -C ~/.gemini/config/plugins/permission-reviewer pull
   - Tier 3: `claude -p --model opus` / `sonnet` (fallback if `agy` fails)
   - Tier 4: Fallback to manual confirmation (`force_ask`)
 - **Strict User Policy**: **Never auto-drops or hard-denies**. Operations judged risky always prompt the user with reasons.
-- **Fast-path Optimization**: Safe sandboxed commands and safe workspace file edits pass immediately with 0ms overhead.
+- **Fast-path Optimization**:
+  - Safe sandboxed commands and safe workspace file edits (`write_file`, `edit_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`) pass immediately with 0ms overhead.
+  - Non-sensitive read-only operations (`read_file`, `view_file`, `grep_search`, `list_dir`, `find_by_name`, `search_web`) pass immediately even outside the workspace (e.g. `~/.cache`), regardless of whether `agy` Auto mode is on or off.
 - **Static Safety Gates**:
-  - Blocks automated `.env` file reads/edits (prompts user via `force_ask`).
+  - Blocks automated `.env` and sensitive credential path (`~/.ssh`, `~/.aws`, `~/.gnupg`) reads/edits (prompts user via `force_ask`).
   - Classifies `psql`: read-only `SELECT` queries auto-approved, `DROP` or write queries prompt user via `force_ask`.
 
 ## Structure
