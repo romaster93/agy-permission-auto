@@ -6,8 +6,8 @@ Antigravity (agy) PreToolUse hook: AI-assisted permission reviewer & safety gate
 - Ported from Claude Code permission-reviewer.py and permission-gates.py.
 - Bootstraps ~/.gemini/antigravity-cli/settings.json (`permissions.allow` wildcards)
   so agy's built-in Auto mode classifier defers to this hook (`auto_approve` vs `force_ask`).
-- Fast-paths harmless sandboxed operations and safe workspace edits for zero latency.
-- Enforces static safety gates (.env file access, psql query classification).
+- Fast-paths harmless sandboxed operations, read-only file lookups, and safe workspace edits.
+- Enforces static safety gates (.env file access, credential paths, psql query classification).
 - Routes risky / unsandboxed operations to Claude Opus/Sonnet via `agy -p` (Tier 1),
   falling back to `agy -p` default model (Tier 2), and `claude -p` (Tier 3).
 - STRICT USER REQUIREMENT: Never auto-drop/deny. Anything judged unsafe or failing
@@ -29,9 +29,29 @@ import time
 
 HEAVY_TOOLS = {
     "run_command",
+    "write_file",
     "write_to_file",
+    "edit_file",
     "replace_file_content",
     "multi_replace_file_content",
+}
+
+WRITE_FILE_TOOLS = {
+    "write_file",
+    "write_to_file",
+    "edit_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+}
+
+READ_FILE_TOOLS = {
+    "read_file",
+    "view_file",
+    "grep_search",
+    "list_dir",
+    "find_by_name",
+    "view_file_outline",
+    "view_code_item",
 }
 
 REQUIRED_ALLOW_RULES = [
@@ -68,6 +88,12 @@ WRITEY_SQL = [
     "grant", "revoke", "vacuum", "analyze", "comment", "do", "call",
     "copy", "refresh", "reindex", "cluster", "lock", "set", "reset",
     "begin", "commit", "rollback", "savepoint", "prepare", "execute",
+]
+
+SENSITIVE_READ_PATTERNS = [
+    r"(^|/)\.ssh(/|$)",
+    r"(^|/)\.aws(/|$)",
+    r"(^|/)\.gnupg(/|$)",
 ]
 
 SENSITIVE_PATH_PATTERNS = [
@@ -168,255 +194,222 @@ def emit_allow(reason="AI reviewer approved"):
         "decision": "auto_approve",
     }
     sys.stdout.write(json.dumps(output))
+    sys.stdout.flush()
 
 
-def emit_ask(reason="AI reviewer flagged this request"):
+def emit_ask(reason="User confirmation required by AI safety reviewer"):
     """
-    Prompt the user with the given reason.
-    NOTE: In accordance with user settings, requests are NEVER dropped or auto-denied.
-    `force_ask` guarantees the user is shown the confirmation dialog with reason,
-    even when `permissions.allow` contains wildcard rules.
+    NEVER return 'deny'. Always return 'force_ask' so the user gets an interactive
+    confirmation prompt with the exact reason displayed.
     """
     output = {
         "decision": "force_ask",
         "reason": reason,
     }
     sys.stdout.write(json.dumps(output))
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
-# Static Gates (.env & psql)
+# Static Safety Gates (ported from permission-gates.py)
 # ---------------------------------------------------------------------------
-
-def check_env_ref(text):
-    """Check if text references a .env or .env.* file."""
-    return bool(re.search(r'(^|[ \t"\'/])\.env(\.[^ \t"\'/]+)?($|[ \t"\'/])', text))
-
 
 def parse_tokens(cmd):
     try:
-        return shlex.split(cmd)
-    except Exception:
+        return shlex.split(cmd, posix=True)
+    except ValueError:
         return cmd.split()
 
 
+def check_env_ref(text):
+    """Detect references to .env files (excluding .env.example / .env.sample / .env.template)."""
+    if not text:
+        return False
+    cleaned = re.sub(r"\.env\.(example|sample|template|defaults|dist)\b", "", text, flags=re.IGNORECASE)
+    return bool(re.search(r"(^|[\s/\"'=])\.env(\.[\w-]+)?([\s\"']|$)", cleaned))
+
+
 def is_psql_command(tokens):
-    i = 0
-    while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tokens[i]):
-        i += 1
-    if i < len(tokens) and (tokens[i] == "psql" or tokens[i].endswith("/psql") or tokens[i].endswith("\\psql.exe")):
-        return i
+    for i, t in enumerate(tokens):
+        base = t.rsplit("/", 1)[-1]
+        if base == "psql":
+            return i
     return None
 
 
 def extract_psql_sql(tokens, psql_idx):
-    i = psql_idx + 1
-    while i < len(tokens):
-        t = tokens[i]
-        if t in ("-c", "--command"):
-            return tokens[i + 1] if i + 1 < len(tokens) else ""
-        if t.startswith("--command="):
-            return t.split("=", 1)[1]
-        if t in ("-f", "--file"):
+    args = tokens[psql_idx + 1 :]
+    sqls = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "--command") and i + 1 < len(args):
+            sqls.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--command="):
+            sqls.append(a.split("=", 1)[1])
+            i += 1
+            continue
+        if a.startswith("-c") and len(a) > 2:
+            sqls.append(a[2:])
+            i += 1
+            continue
+        if a in ("-f", "--file") or a.startswith("-f") or a.startswith("--file="):
             return None
         i += 1
-    return None
+    return "\n".join(sqls) if sqls else None
+
+
+def strip_sql_comments_and_strings(sql):
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"'(?:''|[^'])*'", "''", sql)
+    return sql
 
 
 def classify_sql(sql):
-    s = sql.strip().lower()
-    if re.search(r"\bdrop\b", s):
-        return "ask", "psql: DROP 쿼리 감지 — 사용자 확인 필요"
+    cleaned = strip_sql_comments_and_strings(sql).strip()
+    if not cleaned:
+        return ("ask", "빈 SQL 문 — 수동 확인 필요")
 
-    starts = bool(re.match(r"^(select|with)\b", s))
-    has_select = bool(re.search(r"\bselect\b", s))
-    has_into = bool(re.search(r"\binto\b", s))
-    has_writey = any(re.search(rf"\b{k}\b", s) for k in WRITEY_SQL)
+    stmts = [s.strip() for s in cleaned.split(";") if s.strip()]
+    writey_re = re.compile(r"\b(" + "|".join(WRITEY_SQL) + r")\b", re.IGNORECASE)
 
-    if starts and has_select and (not has_into) and (not has_writey):
-        return "allow", "psql: 읽기 전용 SELECT 쿼리 자동 승인"
+    for s in stmts:
+        m = writey_re.search(s)
+        if m:
+            return ("ask", f"SQL 변경/잠금 키워드 감지 ({m.group(1).upper()}) — 수동 확인 필요")
+        first = s.split(None, 1)[0].lower() if s.split() else ""
+        if first not in ("select", "with", "explain", "show", "table", "values"):
+            return ("ask", f"비조회 SQL 문장 ({first}) — 수동 확인 필요")
 
-    return "ask", "psql: 쓰기/비-SELECT 쿼리 — 사용자 확인 필요"
+    return ("allow", "읽기 전용 SQL 조회 승인")
 
 
 # ---------------------------------------------------------------------------
-# LLM Reviewer Invocation (Multi-tier: agy Claude -> agy Default -> claude -> ask)
+# AI Model Reviewer (3-Tier Fallback: agy Opus/Sonnet -> agy Default -> claude)
 # ---------------------------------------------------------------------------
 
-def _extract_decision(text):
-    """Find the last balanced {...} span that parses as JSON with an 'ok' key."""
-    if not text:
+def _parse_llm_json(raw_output):
+    """Extract {"ok": ...} JSON object from model stdout."""
+    if not raw_output:
         return None
-    candidates = []
-    depth = 0
-    start = -1
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    candidates.append(text[start : i + 1])
-                    start = -1
-    for cand in reversed(candidates):
-        try:
-            obj = json.loads(cand)
-            if isinstance(obj, dict) and "ok" in obj:
-                return obj
-        except Exception:
-            continue
-    return None
-
-
-def _run_agy_print(prompt, env, model=None, timeout_sec=25):
-    """
-    Invoke `agy` in headless print mode.
-    IMPORTANT: `-p` must immediately precede `prompt` (`-p <prompt>`),
-    and `stdin` must be `DEVNULL` so `agy` does not read from the hook's stdin pipe.
-    """
-    agy_bin = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
-    cmd = [
-        agy_bin,
-        "--disable-slash-commands",
-        "--print-timeout", "20s",
-    ]
-    if model:
-        cmd.extend(["--model", model])
-    cmd.extend(["-p", prompt])
-    return subprocess.run(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
-        env=env,
-    )
-
-
-def _pick_fallback_claude_from_stderr(stderr_text, want_opus=True):
-    """If agy prints 'available models: ...', find a matching Claude model slug."""
-    m = re.search(r"available models:\s*(.+)", stderr_text, re.IGNORECASE)
+    text = raw_output.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    m = re.search(r"\{.*?\}", text, re.DOTALL)
     if not m:
         return None
-    models = [x.strip() for x in m.group(1).split(",") if x.strip()]
-    target = "opus" if want_opus else "sonnet"
-    for mod in models:
-        if target in mod.lower():
-            return mod
-    for mod in models:
-        if "claude" in mod.lower():
-            return mod
+    try:
+        parsed = json.loads(m.group(0))
+        if isinstance(parsed, dict) and "ok" in parsed:
+            return parsed
+    except Exception:
+        pass
     return None
 
 
-def call_llm_reviewer(request_info, tool_name):
-    """
-    Tier 1: `agy --model claude-opus-5-5 -p ...` (or `claude-sonnet-5-5`)
-    Tier 2: `agy -p ...` (default active model in agy, e.g. Gemini)
-    Tier 3: `claude -p --model opus|sonnet ...`
-    Tier 4: fallback to asking the user (never drop!)
-    """
-    is_heavy = tool_name in HEAVY_TOOLS
-    agy_claude_model = "claude-opus-5-5" if is_heavy else "claude-sonnet-5-5"
-    claude_cli_model = "opus" if is_heavy else "sonnet"
-
+def _build_clean_env():
     env = os.environ.copy()
-    current_depth = int(os.environ.get("AGY_PERMISSION_REVIEWER_DEPTH", "0"))
     env["AGY_PERMISSION_REVIEWER_ACTIVE"] = "1"
     env["CLAUDE_PERMISSION_REVIEWER_ACTIVE"] = "1"
-    env["AGY_PERMISSION_REVIEWER_DEPTH"] = str(current_depth + 1)
-    env["CLAUDE_PERMISSION_REVIEWER_DEPTH"] = str(current_depth + 1)
+    depth = int(env.get("AGY_PERMISSION_REVIEWER_DEPTH", "0"))
+    env["AGY_PERMISSION_REVIEWER_DEPTH"] = str(depth + 1)
+    env["CLAUDE_PERMISSION_REVIEWER_DEPTH"] = str(depth + 1)
+    return env
 
-    full_prompt = (
-        SYSTEM_PROMPT
-        + "\n\nReview this request and respond ONLY with JSON {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}:\n\n"
-        + request_info
-    )
 
-    # -----------------------------------------------------------------------
-    # Tier 1: agy -p with Claude model (claude-opus-5-5 / claude-sonnet-5-5)
-    # -----------------------------------------------------------------------
+def _try_agy_cli(prompt_text, model=None, timeout=18):
+    agy_bin = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+    if not os.path.exists(agy_bin):
+        return None
+
+    cmd = [agy_bin, "-p", prompt_text, "--output-format", "text"]
+    if model:
+        cmd.extend(["--model", model])
+
     try:
-        result = _run_agy_print(full_prompt, env, model=agy_claude_model)
-        if result.returncode == 0 and result.stdout.strip():
-            dec = _extract_decision(result.stdout)
-            if dec is not None:
-                _log(f"Tier 1 ({agy_claude_model}) succeeded: {dec}")
-                return dec
-        else:
-            _log(f"Tier 1 ({agy_claude_model}) rc={result.returncode} stderr={result.stderr.strip()[:200]}")
-            alt_model = _pick_fallback_claude_from_stderr(result.stderr, want_opus=is_heavy)
-            if alt_model and alt_model != agy_claude_model:
-                result2 = _run_agy_print(full_prompt, env, model=alt_model)
-                if result2.returncode == 0 and result2.stdout.strip():
-                    dec = _extract_decision(result2.stdout)
-                    if dec is not None:
-                        _log(f"Tier 1b ({alt_model}) succeeded: {dec}")
-                        return dec
-    except Exception as e:
-        _log(f"Tier 1 exception: {e}")
-
-    # -----------------------------------------------------------------------
-    # Tier 2: agy -p with default active model (no --model flag)
-    # -----------------------------------------------------------------------
-    try:
-        result = _run_agy_print(full_prompt, env, model=None)
-        if result.returncode == 0 and result.stdout.strip():
-            dec = _extract_decision(result.stdout)
-            if dec is not None:
-                _log(f"Tier 2 (agy default) succeeded: {dec}")
-                return dec
-        else:
-            _log(f"Tier 2 (agy default) rc={result.returncode} stderr={result.stderr.strip()[:200]}")
-    except Exception as e:
-        _log(f"Tier 2 exception: {e}")
-
-    # -----------------------------------------------------------------------
-    # Tier 3: claude -p with Opus/Sonnet
-    # -----------------------------------------------------------------------
-    try:
-        claude_bin = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-        claude_cmd = [
-            claude_bin,
-            "-p",
-            "--output-format", "json",
-            "--model", claude_cli_model,
-            "--no-session-persistence",
-            "--append-system-prompt", SYSTEM_PROMPT,
-            "Review this request:\n\n" + request_info,
-        ]
-        result = subprocess.run(
-            claude_cmd,
-            stdin=subprocess.DEVNULL,
+        res = subprocess.run(
+            cmd,
             capture_output=True,
             text=True,
-            timeout=20,
-            env=env,
+            env=_build_clean_env(),
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            cwd="/tmp",
         )
-        if result.returncode == 0 and result.stdout.strip():
-            try:
-                resp = json.loads(result.stdout)
-                text = resp.get("result", "")
-                dec = _extract_decision(text)
-                if dec is not None:
-                    _log(f"Tier 3 (claude {claude_cli_model}) succeeded: {dec}")
-                    return dec
-            except Exception:
-                dec = _extract_decision(result.stdout)
-                if dec is not None:
-                    _log(f"Tier 3 (claude raw) succeeded: {dec}")
-                    return dec
-        else:
-            _log(f"Tier 3 (claude) rc={result.returncode} stderr={result.stderr.strip()[:200]}")
+        if res.returncode == 0 and res.stdout:
+            return _parse_llm_json(res.stdout)
+        _log(f"agy (model={model}) non-zero or empty: rc={res.returncode} stderr={res.stderr[:200]}")
     except Exception as e:
-        _log(f"Tier 3 exception: {e}")
+        _log(f"agy (model={model}) exception: {e}")
+    return None
 
-    # -----------------------------------------------------------------------
-    # Tier 4: All failed or quota 0 -> ask user, never drop
-    # -----------------------------------------------------------------------
+
+def _try_claude_cli(prompt_text, model="sonnet", timeout=18):
+    claude_bin = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    if not os.path.exists(claude_bin):
+        return None
+
+    cmd = [
+        claude_bin,
+        "-p",
+        "--model", model,
+        "--output-format", "text",
+        "--no-session-persistence",
+        "--permission-mode", "ReadOnly",
+        "--system-prompt", SYSTEM_PROMPT,
+        prompt_text,
+    ]
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=_build_clean_env(),
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            cwd="/tmp",
+        )
+        if res.returncode == 0 and res.stdout:
+            return _parse_llm_json(res.stdout)
+        _log(f"claude (model={model}) non-zero or empty: rc={res.returncode} stderr={res.stderr[:200]}")
+    except Exception as e:
+        _log(f"claude (model={model}) exception: {e}")
+    return None
+
+
+def call_llm_reviewer(request_summary, tool_name):
+    """
+    Tier 1: `agy -p` with Claude Opus 4.6 (for heavy tools) or Claude Sonnet 4.6 (for lighter tools)
+    Tier 2: `agy -p` with default model (if Claude quota/rate limit is reached)
+    Tier 3: `claude -p` (if agy CLI fails or is unavailable)
+    Fallback: Returns {"ok": False, "reason": ...} -> triggers `force_ask` (never auto-deny).
+    """
+    full_prompt = f"{SYSTEM_PROMPT}\n\n[Request under review]\n{request_summary}"
+    primary_agy_model = "claude-opus-4-6" if tool_name in HEAVY_TOOLS else "claude-sonnet-4-6"
+
+    # Tier 1: agy with target Claude model
+    result = _try_agy_cli(full_prompt, model=primary_agy_model)
+    if result is not None:
+        _log(f"Tier 1 (agy {primary_agy_model}) decision for {tool_name}: {result}")
+        return result
+
+    # Tier 2: agy with default model (e.g. Gemini 3.1 Pro when Claude quota is exhausted)
+    result = _try_agy_cli(full_prompt, model=None)
+    if result is not None:
+        _log(f"Tier 2 (agy default) decision for {tool_name}: {result}")
+        return result
+
+    # Tier 3: claude CLI fallback
+    claude_model = "opus" if tool_name in HEAVY_TOOLS else "sonnet"
+    result = _try_claude_cli(request_summary, model=claude_model)
+    if result is not None:
+        _log(f"Tier 3 (claude {claude_model}) decision for {tool_name}: {result}")
+        return result
+
+    _log(f"All AI reviewer tiers failed for {tool_name}; falling back to force_ask.")
     return {
         "ok": False,
         "reason": "AI 리뷰어 응답 없음 또는 사용량 소진 — 수동 확인이 필요합니다.",
@@ -504,22 +497,40 @@ def main():
             emit_ask("AI 리뷰어 확인 요청: " + review.get("reason", "잠재적 위험 감지"))
         return
 
-    # 4. Static Safety Gates for file operations
-    if tool_name in ("write_to_file", "replace_file_content", "multi_replace_file_content", "view_file"):
-        target_file = tool_args.get("TargetFile") or tool_args.get("AbsolutePath") or ""
+    # 4. Static Safety Gates for file operations (both read and write/edit tools)
+    if tool_name in WRITE_FILE_TOOLS or tool_name in READ_FILE_TOOLS:
+        target_file = (
+            tool_args.get("Path")
+            or tool_args.get("TargetFile")
+            or tool_args.get("AbsolutePath")
+            or tool_args.get("File")
+            or tool_args.get("SearchPath")
+            or tool_args.get("DirectoryPath")
+            or tool_args.get("SearchDirectory")
+            or ""
+        )
 
-        # 4a. .env check
+        # 4a. .env check (applies to both read and write)
         if check_env_ref(target_file):
             emit_ask("[보안 게이트] 민감 파일(.env) 편집/조회 감지 — 사용자 확인 필요")
             return
 
-        # 4b. Check sensitive OS/credential/shell-init paths
+        # 4b. Read-only file/directory tools: block sensitive credential dirs, fast-path everything else
+        if tool_name in READ_FILE_TOOLS:
+            for pat in SENSITIVE_READ_PATTERNS:
+                if re.search(pat, target_file):
+                    emit_ask(f"[보안 게이트] 민감 인증서/키 경로({target_file}) 조회 감지 — 사용자 확인 필요")
+                    return
+            emit_allow("안전한 파일/디렉토리 조회 고속 통과")
+            return
+
+        # 4c. Write/Edit tools: check sensitive OS/credential/shell-init paths
         for pat in SENSITIVE_PATH_PATTERNS:
             if re.search(pat, target_file):
-                emit_ask(f"[보안 게이트] 시스템/인증서 경로({target_file}) 감지 — 사용자 확인 필요")
+                emit_ask(f"[보안 게이트] 시스템/인증서 경로({target_file}) 편집 감지 — 사용자 확인 필요")
                 return
 
-        # 4c. Fast-path: internal brain artifacts/scratch or safe workspace paths
+        # 4d. Fast-path for Write/Edit: internal brain artifacts/scratch or safe workspace paths
         is_brain = "/.gemini/antigravity-cli/brain/" in target_file
         is_in_workspace = any(
             target_file.startswith(ws.rstrip("/") + "/") or target_file == ws
@@ -530,7 +541,7 @@ def main():
             emit_allow("워크스페이스 내부 파일 작업 고속 통과")
             return
 
-        # If outside workspace, review with AI
+        # If writing/editing outside workspace, review with AI
         request_info = f"Tool: {tool_name}\nTargetFile: {target_file}\nOverwrite: {tool_args.get('Overwrite', False)}\nDescription: {tool_args.get('Description', '')[:500]}"
         review = call_llm_reviewer(request_info, tool_name)
         if review.get("ok", True):
@@ -539,7 +550,15 @@ def main():
             emit_ask("AI 리뷰어 파일 작업 확인 요청: " + review.get("reason", "잠재적 위험 감지"))
         return
 
-    # 5. Network / URL tools (read_url_content)
+    # 5. Network / URL tools (read_url_content, search_web)
+    if tool_name == "search_web":
+        query = tool_args.get("query", "")
+        if check_env_ref(query):
+            emit_ask("[보안 게이트] 웹 검색 쿼리에 민감 정보(.env) 포함 의심 — 사용자 확인 필요")
+            return
+        emit_allow("웹 검색 고속 통과")
+        return
+
     if tool_name == "read_url_content":
         url = tool_args.get("Url", "")
         request_info = f"Tool: read_url_content\nUrl: {url}"
