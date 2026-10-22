@@ -109,6 +109,7 @@ SENSITIVE_PATH_PATTERNS = [
     r"^/boot(/|$)",
     r"^/sys(/|$)",
     r"^/proc(/|$)",
+    r"^[a-zA-Z]:/windows(/|$)",
 ]
 
 SYSTEM_PROMPT = """\
@@ -145,6 +146,16 @@ def _log(msg):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except Exception:
         pass
+
+
+def _norm_path(p):
+    """Normalize path separators to forward slashes (and lowercase on Windows)."""
+    if not isinstance(p, str):
+        return ""
+    norm = p.replace("\\", "/")
+    if os.name == "nt":
+        norm = norm.lower()
+    return norm
 
 
 def ensure_cli_permissions_allow():
@@ -220,7 +231,7 @@ def emit_ask(reason="User confirmation required by AI safety reviewer"):
 
 def parse_tokens(cmd):
     try:
-        return shlex.split(cmd, posix=True)
+        return shlex.split(cmd, posix=(os.name != "nt"))
     except ValueError:
         return cmd.split()
 
@@ -230,13 +241,13 @@ def check_env_ref(text):
     if not text:
         return False
     cleaned = re.sub(r"\.env\.(example|sample|template|defaults|dist)\b", "", text, flags=re.IGNORECASE)
-    return bool(re.search(r"(^|[\s/\"'=])\.env(\.[\w-]+)?([\s\"']|$)", cleaned))
+    return bool(re.search(r"(^|[\s/\\\"'=])\.env(\.[\w-]+)?([\s\"']|$)", cleaned, flags=re.IGNORECASE))
 
 
 def is_psql_command(tokens):
     for i, t in enumerate(tokens):
-        base = t.rsplit("/", 1)[-1]
-        if base == "psql":
+        base = re.split(r"[/\\]", t.strip("\"'"))[-1].lower()
+        if base in ("psql", "psql.exe"):
             return i
     return None
 
@@ -323,13 +334,40 @@ def _extract_decision(text):
     return None
 
 
+def _find_agy_bin():
+    found = shutil.which("agy")
+    if found:
+        return found
+    for candidate in (
+        os.path.expanduser("~/.local/bin/agy"),
+        os.path.expanduser("~/AppData/Local/agy/bin/agy.exe"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return "agy"
+
+
+def _find_claude_bin():
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in (
+        os.path.expanduser("~/.local/bin/claude"),
+        os.path.expanduser("~/.local/bin/claude.exe"),
+        os.path.expanduser("~/AppData/Roaming/npm/claude.cmd"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return "claude"
+
+
 def _run_agy_print(prompt, env, model=None, timeout_sec=25):
     """
     Invoke `agy` in headless print mode.
     IMPORTANT: `-p` must immediately precede `prompt` (`-p <prompt>`),
     and `stdin` must be `DEVNULL` so `agy` does not read from the hook's stdin pipe.
     """
-    agy_bin = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+    agy_bin = _find_agy_bin()
     cmd = [
         agy_bin,
         "--disable-slash-commands",
@@ -343,6 +381,8 @@ def _run_agy_print(prompt, env, model=None, timeout_sec=25):
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout_sec,
         env=env,
     )
@@ -381,6 +421,8 @@ def call_llm_reviewer(request_info, tool_name):
     env["CLAUDE_PERMISSION_REVIEWER_ACTIVE"] = "1"
     env["AGY_PERMISSION_REVIEWER_DEPTH"] = str(current_depth + 1)
     env["CLAUDE_PERMISSION_REVIEWER_DEPTH"] = str(current_depth + 1)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
     full_prompt = (
         SYSTEM_PROMPT
@@ -430,7 +472,7 @@ def call_llm_reviewer(request_info, tool_name):
     # Tier 3: claude -p with Opus/Sonnet
     # -----------------------------------------------------------------------
     try:
-        claude_bin = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+        claude_bin = _find_claude_bin()
         claude_cmd = [
             claude_bin,
             "-p",
@@ -445,6 +487,8 @@ def call_llm_reviewer(request_info, tool_name):
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
             env=env,
         )
@@ -480,6 +524,11 @@ def call_llm_reviewer(request_info, tool_name):
 # ---------------------------------------------------------------------------
 
 def main():
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     # 1. Recursion guard
     if (
         os.environ.get("AGY_PERMISSION_REVIEWER_ACTIVE") == "1"
@@ -568,6 +617,7 @@ def main():
             or tool_args.get("SearchDirectory")
             or ""
         )
+        norm_target = target_file.replace("\\", "/") if isinstance(target_file, str) else ""
 
         # 4a. .env check (applies to both read and write)
         if check_env_ref(target_file):
@@ -577,7 +627,7 @@ def main():
         # 4b. Read-only file/directory tools: block sensitive credential dirs, fast-path everything else
         if tool_name in READ_FILE_TOOLS:
             for pat in SENSITIVE_READ_PATTERNS:
-                if re.search(pat, target_file):
+                if re.search(pat, norm_target, re.IGNORECASE):
                     emit_ask(f"[보안 게이트] 민감 인증서/키 경로({target_file}) 조회 감지 — 사용자 확인 필요")
                     return
             emit_allow("안전한 파일/디렉토리 조회 고속 통과")
@@ -585,15 +635,21 @@ def main():
 
         # 4c. Write/Edit tools: check sensitive OS/credential/shell-init paths
         for pat in SENSITIVE_PATH_PATTERNS:
-            if re.search(pat, target_file):
+            if re.search(pat, norm_target, re.IGNORECASE):
                 emit_ask(f"[보안 게이트] 시스템/인증서 경로({target_file}) 편집 감지 — 사용자 확인 필요")
                 return
 
         # 4d. Fast-path for Write/Edit: internal brain artifacts/scratch or safe workspace paths
-        is_brain = "/.gemini/antigravity-cli/brain/" in target_file
+        norm_cmp = _norm_path(target_file)
+        is_brain = (
+            "/.gemini/antigravity-cli/brain/" in norm_cmp
+            or "/.gemini/antigravity/brain/" in norm_cmp
+            or "/.gemini/antigravity-ide/brain/" in norm_cmp
+        )
         is_in_workspace = any(
-            target_file.startswith(ws.rstrip("/") + "/") or target_file == ws
+            norm_cmp.startswith(_norm_path(ws).rstrip("/") + "/") or norm_cmp == _norm_path(ws).rstrip("/")
             for ws in workspace_paths
+            if isinstance(ws, str) and ws.strip()
         )
 
         if is_brain or is_in_workspace:
