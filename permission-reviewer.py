@@ -132,7 +132,8 @@ Flag for confirmation ONLY when the risk is real and irreversible:
 - Publishing packages to public registries or deploying unvetted code to production
 - Commands that exfiltrate private repository data
 
-Respond ONLY with a JSON object: {"ok": true} to approve or {"ok": false, "reason": "concise explanation"} to require user confirmation.
+Respond ONLY with a JSON object: {"ok": true} to approve or {"ok": false, "reason": "한국어로 작성된 상세한 확인 요청 사유"} to require user confirmation.
+IMPORTANT: The "reason" field MUST ALWAYS be written in Korean (한국어), clearly explaining what the command/operation does and why user confirmation is needed.
 No other text.
 """
 
@@ -469,7 +470,7 @@ def call_llm_reviewer(request_info, tool_name):
 
     full_prompt = (
         SYSTEM_PROMPT
-        + "\n\nReview this request and respond ONLY with JSON {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}:\n\n"
+        + "\n\nReview this request and respond ONLY with JSON {\"ok\": true} or {\"ok\": false, \"reason\": \"한국어로 작성된 사유\"}:\n\n"
         + request_info
     )
 
@@ -523,7 +524,7 @@ def call_llm_reviewer(request_info, tool_name):
             "--model", claude_cli_model,
             "--no-session-persistence",
             "--append-system-prompt", SYSTEM_PROMPT,
-            "Review this request:\n\n" + request_info,
+            "Review this request (reason MUST be in Korean):\n\n" + request_info,
         ]
         result = subprocess.run(
             claude_cmd,
