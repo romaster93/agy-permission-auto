@@ -9,7 +9,7 @@ mkdir -p ~/.gemini/config/plugins
 git clone https://github.com/romaster93/agy-permission-auto.git ~/.gemini/config/plugins/permission-reviewer
 ```
 
-설치 후 `agy`를 실행하면 첫 도구 호출 시 자동으로 `~/.gemini/antigravity-cli/settings.json`에 `permissions.allow` 와일드카드 권한(`command(*)`, `write_file(*)` 등)을 부트스트랩하여, `agy` 내장 Auto mode 심사기가 불필요하게 재차 확인창을 띄우지 않고 **본 플러그인(`auto_approve` / `force_ask`)이 전권을 위임받아 심사**하도록 설정됩니다.
+설치 후 `agy`를 실행하면 첫 도구 호출 시 자동으로 `~/.gemini/antigravity-cli/settings.json`에 `permissions.allow` 와일드카드 권한(`command(*)`, `write_file(*)` 등)과 **컨텍스트 50%(`512K`) 자동 압축 설정(`"contextWindow": "512K"`, `~/.bashrc`의 `AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"`)**을 부트스트랩하여, `agy` 내장 Auto mode 심사기가 불필요하게 재차 확인창을 띄우지 않고 **본 플러그인(`auto_approve` / `force_ask`)이 전권을 위임받아 심사**하도록 설정됩니다.
 
 > **참고**: 처음 설치한 직후 실행 중이던 세션이 있다면, 자동 설정된 `settings.json`이 반영되도록 `agy`를 한 번 재시작해 주세요.
 

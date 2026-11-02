@@ -160,10 +160,12 @@ def _norm_path(p):
 
 def ensure_cli_permissions_allow():
     """
-    Ensure ~/.gemini/antigravity-cli/settings.json contains wildcard allow rules
-    so that agy's built-in Auto mode classifier (which emits priority-3 'ask' signals)
-    defers to this PreToolUse hook (which emits priority-2 'auto_approve' or
-    priority-5 'force_ask').
+    Ensure ~/.gemini/antigravity-cli/settings.json contains:
+      1. wildcard allow rules (`permissions.allow`) so that agy's built-in Auto mode
+         classifier defers to this PreToolUse hook (`auto_approve` vs `force_ask`).
+      2. `"contextWindow": "512K"` so 1M context models (like Gemini 4 Argon) compact
+         at ~50% (512K) instead of the default 20% (256K).
+    Also ensures ~/.bashrc exports `AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"` on POSIX systems.
     """
     settings_path = os.path.expanduser("~/.gemini/antigravity-cli/settings.json")
     try:
@@ -182,18 +184,44 @@ def ensure_cli_permissions_allow():
             allow_list = []
             perms["allow"] = allow_list
 
+        changed = False
         missing = [r for r in REQUIRED_ALLOW_RULES if r not in allow_list]
         if missing:
             allow_list.extend(missing)
+            changed = True
+
+        if data.get("contextWindow") in (None, "", "256K"):
+            data["contextWindow"] = "512K"
+            changed = True
+
+        if changed:
             os.makedirs(os.path.dirname(settings_path), exist_ok=True)
             tmp_path = settings_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 f.write("\n")
             os.replace(tmp_path, settings_path)
-            _log(f"Bootstrapped permissions.allow in {settings_path}: added {missing}")
+            _log(
+                f"Bootstrapped {settings_path}: added_allow={missing}, "
+                f"contextWindow={data.get('contextWindow')}"
+            )
     except Exception as e:
-        _log(f"ensure_cli_permissions_allow error: {e}")
+        _log(f"ensure_cli_permissions_allow settings error: {e}")
+
+    if os.name != "nt":
+        bashrc_path = os.path.expanduser("~/.bashrc")
+        try:
+            if os.path.exists(bashrc_path):
+                with open(bashrc_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                if "AGY_CLI_AUTO_COMPACT_OVERRIDE" not in content:
+                    with open(bashrc_path, "a", encoding="utf-8") as f:
+                        if content and not content.endswith("\n"):
+                            f.write("\n")
+                        f.write('export AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"\n')
+                    _log(f"Bootstrapped AGY_CLI_AUTO_COMPACT_OVERRIDE=50% in {bashrc_path}")
+        except Exception as e:
+            _log(f"ensure_cli_permissions_allow bashrc error: {e}")
 
 
 # ---------------------------------------------------------------------------
