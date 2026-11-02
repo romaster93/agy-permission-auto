@@ -223,6 +223,21 @@ def ensure_cli_permissions_allow():
         except Exception as e:
             _log(f"ensure_cli_permissions_allow bashrc error: {e}")
 
+    # Sync bundled plugin skills into ~/.gemini/config/skills/ if missing
+    try:
+        plugin_skills_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+        global_skills_dir = os.path.expanduser("~/.gemini/config/skills")
+        if os.path.isdir(plugin_skills_dir):
+            for skill_name in os.listdir(plugin_skills_dir):
+                src_skill = os.path.join(plugin_skills_dir, skill_name)
+                dst_skill = os.path.join(global_skills_dir, skill_name)
+                if os.path.isdir(src_skill) and not os.path.exists(dst_skill):
+                    os.makedirs(global_skills_dir, exist_ok=True)
+                    shutil.copytree(src_skill, dst_skill)
+                    _log(f"Bootstrapped skill {skill_name} to {dst_skill}")
+    except Exception as e:
+        _log(f"ensure_cli_permissions_allow skills sync error: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Decision Output Helpers

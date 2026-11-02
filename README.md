@@ -35,6 +35,9 @@ git -C ~/.gemini/config/plugins/permission-reviewer pull
 - **Static Safety Gates**:
   - Blocks automated `.env` and sensitive credential path (`~/.ssh`, `~/.aws`, `~/.gnupg`) reads/edits (prompts user via `force_ask`).
   - Classifies `psql`: read-only `SELECT` queries auto-approved, `DROP` or write queries prompt user via `force_ask`.
+- **Bundled Skills (`skills/`)**:
+  - **`motivation-not-novelty`**: 연구/논문 작성 시 단순 현상 관찰(Motivation)에서 근본 원인 진단·방법론 도출·필수성 입증(Novelty)으로 끌어올리는 가이드라인 스킬
+  - **`session-wrap`**: 세션 종료 전 4개의 병렬 분석 서브에이전트(`Doc Updater`, `Automation Scout`, `Learning Extractor`, `Follow-up Suggester`) + 중복 검증 서브에이전트(`Duplicate Checker`)를 실행하여 문서화·자동화·TIL·후속 작업을 정리하는 워크플로우 스킬
 
 ## Structure
 
@@ -43,6 +46,14 @@ permission-reviewer/
 ├── plugin.json             # Plugin manifest
 ├── hooks.json              # PreToolUse lifecycle hook registration
 ├── permission-reviewer.py  # Reviewer script
+├── skills/                 # Bundled Antigravity skills (auto-loaded & synced)
+│   ├── motivation-not-novelty/
+│   │   └── SKILL.md
+│   └── session-wrap/
+│       ├── SKILL.md
+│       └── references/
+│           ├── agents.md
+│           └── multi-agent-patterns.md
 └── README.md
 ```
 
