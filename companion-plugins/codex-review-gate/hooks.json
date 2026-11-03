@@ -1,0 +1,11 @@
+{
+  "codex-stop-review-gate": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ~/.gemini/config/plugins/codex-review-gate/codex-review-gate.py",
+        "timeout": 900
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "opus-stop-review-gate": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ~/.gemini/config/plugins/opus-review-gate/opus-review-gate.py",
+        "timeout": 600
+      }
+    ]
+  }
+}

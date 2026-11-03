@@ -38,6 +38,9 @@ git -C ~/.gemini/config/plugins/permission-reviewer pull
 - **Bundled Skills (`skills/`)**:
   - **`motivation-not-novelty`**: 연구/논문 작성 시 단순 현상 관찰(Motivation)에서 근본 원인 진단·방법론 도출·필수성 입증(Novelty)으로 끌어올리는 가이드라인 스킬
   - **`session-wrap`**: 세션 종료 전 4개의 병렬 분석 서브에이전트(`Doc Updater`, `Automation Scout`, `Learning Extractor`, `Follow-up Suggester`) + 중복 검증 서브에이전트(`Duplicate Checker`)를 실행하여 문서화·자동화·TIL·후속 작업을 정리하는 워크플로우 스킬
+- **Companion Stop-Time Review Gate Plugins (`companion-plugins/`, 자동 분리 설치 & 기본 비활성화)**:
+  - **`codex-review-gate`** (`~/.gemini/config/plugins/codex-review-gate`): OpenAI Codex CLI 기반 턴 종료 리뷰 게이트 (`setup --enable-review-gate` / `--disable-review-gate`)
+  - **`opus-review-gate`** (`~/.gemini/config/plugins/opus-review-gate`): `agy` 내장 Claude Opus 5.5 (`claude-opus-5-5`) 기반 턴 종료 리뷰 게이트 (`setup --enable-review-gate` / `--disable-review-gate`)
 
 ## Structure
 
@@ -54,6 +57,9 @@ permission-reviewer/
 │       └── references/
 │           ├── agents.md
 │           └── multi-agent-patterns.md
+├── companion-plugins/      # Separate Stop Review Gate plugins (auto-synced to ~/.gemini/config/plugins/)
+│   ├── codex-review-gate/
+│   └── opus-review-gate/
 └── README.md
 ```
 

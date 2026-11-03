@@ -226,7 +226,8 @@ def ensure_cli_permissions_allow():
 
     # Sync bundled plugin skills into ~/.gemini/config/skills/ if missing
     try:
-        plugin_skills_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+        plugin_root_dir = os.path.dirname(os.path.abspath(__file__))
+        plugin_skills_dir = os.path.join(plugin_root_dir, "skills")
         global_skills_dir = os.path.expanduser("~/.gemini/config/skills")
         if os.path.isdir(plugin_skills_dir):
             for skill_name in os.listdir(plugin_skills_dir):
@@ -236,8 +237,29 @@ def ensure_cli_permissions_allow():
                     os.makedirs(global_skills_dir, exist_ok=True)
                     shutil.copytree(src_skill, dst_skill)
                     _log(f"Bootstrapped skill {skill_name} to {dst_skill}")
+
+        # Sync companion plugins (codex-review-gate, opus-review-gate) into ~/.gemini/config/plugins/ if missing
+        companion_dir = os.path.join(plugin_root_dir, "companion-plugins")
+        global_plugins_dir = os.path.expanduser("~/.gemini/config/plugins")
+        if os.path.isdir(companion_dir):
+            for comp_name in os.listdir(companion_dir):
+                src_comp = os.path.join(companion_dir, comp_name)
+                dst_comp = os.path.join(global_plugins_dir, comp_name)
+                if os.path.isdir(src_comp) and not os.path.exists(dst_comp):
+                    os.makedirs(global_plugins_dir, exist_ok=True)
+                    shutil.copytree(src_comp, dst_comp)
+                    _log(f"Bootstrapped companion plugin {comp_name} to {dst_comp}")
+                comp_skills_dir = os.path.join(src_comp, "skills")
+                if os.path.isdir(comp_skills_dir):
+                    for skill_name in os.listdir(comp_skills_dir):
+                        src_skill = os.path.join(comp_skills_dir, skill_name)
+                        dst_skill = os.path.join(global_skills_dir, skill_name)
+                        if os.path.isdir(src_skill) and not os.path.exists(dst_skill):
+                            os.makedirs(global_skills_dir, exist_ok=True)
+                            shutil.copytree(src_skill, dst_skill)
+                            _log(f"Bootstrapped companion skill {skill_name} to {dst_skill}")
     except Exception as e:
-        _log(f"ensure_cli_permissions_allow skills sync error: {e}")
+        _log(f"ensure_cli_permissions_allow skills/companion sync error: {e}")
 
 
 # ---------------------------------------------------------------------------

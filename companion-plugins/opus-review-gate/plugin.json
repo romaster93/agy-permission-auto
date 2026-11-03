@@ -1,0 +1,5 @@
+{
+  "name": "opus-review-gate",
+  "description": "Claude Opus 5.5 (via agy) stop-time review gate and on-demand code/adversarial review plugin for Antigravity (agy). Disabled by default; toggle on demand via /opus-review-gate.",
+  "version": "1.0.0"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "codex-review-gate",
+  "description": "OpenAI Codex stop-time review gate and on-demand code/adversarial review plugin for Antigravity (agy). Disabled by default; toggle on demand via /codex-review-gate.",
+  "version": "1.0.0"
+}
