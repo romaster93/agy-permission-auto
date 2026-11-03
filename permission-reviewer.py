@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 # ---------------------------------------------------------------------------
@@ -159,6 +160,98 @@ def _norm_path(p):
     return norm
 
 
+def _has_symlink_component(base_dir, target_path):
+    """Return True if any path component from user home / `base_dir` to `target_path` is a symlink."""
+    home_abs = os.path.abspath(os.path.expanduser("~"))
+    target_abs = os.path.abspath(target_path)
+    root_abs = home_abs if target_abs.startswith(home_abs + os.sep) else os.path.abspath(base_dir)
+    cur = root_abs
+    if os.path.islink(cur):
+        return True
+    rel = os.path.relpath(target_abs, root_abs)
+    if rel in (".", ""):
+        return False
+    for part in rel.replace("\\", "/").split("/"):
+        if not part or part == ".":
+            continue
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return True
+    return False
+
+
+def _sync_managed_tree(src_dir, dst_dir):
+    """
+    Selectively and atomically sync regular files from `src_dir` into `dst_dir`
+    without touching unmanaged files or following symlinks. Sets 0o755 on .py entrypoints.
+    Returns count of updated files.
+    """
+    updated = 0
+    if not os.path.isdir(src_dir) or os.path.islink(src_dir) or os.path.islink(dst_dir):
+        return updated
+    for root, dirs, files in os.walk(src_dir, followlinks=False):
+        dirs[:] = [
+            d
+            for d in dirs
+            if d != "__pycache__"
+            and not d.startswith(".")
+            and not os.path.islink(os.path.join(root, d))
+        ]
+        rel_root = os.path.relpath(root, src_dir)
+        target_root = dst_dir if rel_root == "." else os.path.join(dst_dir, rel_root)
+        if _has_symlink_component(dst_dir, target_root):
+            continue
+        for fname in files:
+            if fname.endswith((".pyc", ".pyo", ".tmp")) or fname.startswith("."):
+                continue
+            src_file = os.path.join(root, fname)
+            if os.path.islink(src_file) or not os.path.isfile(src_file):
+                continue
+            dst_file = os.path.join(target_root, fname)
+            if os.path.islink(dst_file):
+                continue
+            try:
+                with open(src_file, "rb") as sf:
+                    src_bytes = sf.read()
+                need_write = True
+                if os.path.isfile(dst_file):
+                    with open(dst_file, "rb") as df:
+                        if df.read() == src_bytes:
+                            need_write = False
+                if need_write:
+                    os.makedirs(target_root, exist_ok=True)
+                    if _has_symlink_component(dst_dir, target_root) or os.path.islink(dst_file):
+                        continue
+                    fd, tmp_file = tempfile.mkstemp(
+                        prefix=f".{fname}.",
+                        suffix=".tmp",
+                        dir=target_root,
+                    )
+                    try:
+                        with os.fdopen(fd, "wb") as tf:
+                            tf.write(src_bytes)
+                        if fname.endswith(".py"):
+                            os.chmod(tmp_file, 0o755)
+                        else:
+                            os.chmod(tmp_file, 0o644)
+                        os.replace(tmp_file, dst_file)
+                        updated += 1
+                    except Exception:
+                        try:
+                            if os.path.exists(tmp_file):
+                                os.remove(tmp_file)
+                        except Exception:
+                            pass
+                        raise
+                elif fname.endswith(".py") and os.name != "nt":
+                    st_mode = os.stat(dst_file).st_mode
+                    if not (st_mode & 0o111):
+                        os.chmod(dst_file, st_mode | 0o755)
+            except Exception as e:
+                _log(f"_sync_managed_tree error ({src_file} -> {dst_file}): {e}")
+    return updated
+
+
 def ensure_cli_permissions_allow():
     """
     Ensure ~/.gemini/antigravity-cli/settings.json contains:
@@ -224,7 +317,7 @@ def ensure_cli_permissions_allow():
         except Exception as e:
             _log(f"ensure_cli_permissions_allow bashrc error: {e}")
 
-    # Sync bundled plugin skills into ~/.gemini/config/skills/ if missing
+    # Sync bundled plugin skills into ~/.gemini/config/skills/
     try:
         plugin_root_dir = os.path.dirname(os.path.abspath(__file__))
         plugin_skills_dir = os.path.join(plugin_root_dir, "skills")
@@ -233,31 +326,31 @@ def ensure_cli_permissions_allow():
             for skill_name in os.listdir(plugin_skills_dir):
                 src_skill = os.path.join(plugin_skills_dir, skill_name)
                 dst_skill = os.path.join(global_skills_dir, skill_name)
-                if os.path.isdir(src_skill) and not os.path.exists(dst_skill):
-                    os.makedirs(global_skills_dir, exist_ok=True)
-                    shutil.copytree(src_skill, dst_skill)
-                    _log(f"Bootstrapped skill {skill_name} to {dst_skill}")
+                if os.path.isdir(src_skill):
+                    cnt = _sync_managed_tree(src_skill, dst_skill)
+                    if cnt > 0:
+                        _log(f"Synced skill {skill_name} to {dst_skill} ({cnt} files updated)")
 
-        # Sync companion plugins (codex-review-gate, opus-review-gate) into ~/.gemini/config/plugins/ if missing
+        # Sync companion plugins (codex-review-gate, opus-review-gate) into ~/.gemini/config/plugins/
         companion_dir = os.path.join(plugin_root_dir, "companion-plugins")
         global_plugins_dir = os.path.expanduser("~/.gemini/config/plugins")
         if os.path.isdir(companion_dir):
             for comp_name in os.listdir(companion_dir):
                 src_comp = os.path.join(companion_dir, comp_name)
                 dst_comp = os.path.join(global_plugins_dir, comp_name)
-                if os.path.isdir(src_comp) and not os.path.exists(dst_comp):
-                    os.makedirs(global_plugins_dir, exist_ok=True)
-                    shutil.copytree(src_comp, dst_comp)
-                    _log(f"Bootstrapped companion plugin {comp_name} to {dst_comp}")
+                if os.path.isdir(src_comp):
+                    cnt = _sync_managed_tree(src_comp, dst_comp)
+                    if cnt > 0:
+                        _log(f"Synced companion plugin {comp_name} to {dst_comp} ({cnt} files updated)")
                 comp_skills_dir = os.path.join(src_comp, "skills")
                 if os.path.isdir(comp_skills_dir):
                     for skill_name in os.listdir(comp_skills_dir):
                         src_skill = os.path.join(comp_skills_dir, skill_name)
                         dst_skill = os.path.join(global_skills_dir, skill_name)
-                        if os.path.isdir(src_skill) and not os.path.exists(dst_skill):
-                            os.makedirs(global_skills_dir, exist_ok=True)
-                            shutil.copytree(src_skill, dst_skill)
-                            _log(f"Bootstrapped companion skill {skill_name} to {dst_skill}")
+                        if os.path.isdir(src_skill):
+                            cnt = _sync_managed_tree(src_skill, dst_skill)
+                            if cnt > 0:
+                                _log(f"Synced companion skill {skill_name} to {dst_skill} ({cnt} files updated)")
     except Exception as e:
         _log(f"ensure_cli_permissions_allow skills/companion sync error: {e}")
 

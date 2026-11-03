@@ -8,7 +8,7 @@ description: >-
 
 # Codex Review Gate Skill (`codex-review-gate`)
 
-Manage the stop-time Codex review gate (**disabled by default**) or run on-demand Codex reviews (`review`, `adversarial-review`) in Antigravity (`agy`).
+Manage the stop-time Codex review gate (**disabled by default**, default model: `gpt-6.1-sol`) or run on-demand Codex reviews (`review`, `adversarial-review`) in Antigravity (`agy`).
 
 ## 1. Setup & Toggle Stop-Time Review Gate (`/codex:setup` equivalent)
 

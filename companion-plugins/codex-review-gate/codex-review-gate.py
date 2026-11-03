@@ -32,6 +32,8 @@ STATE_ROOT = os.path.expanduser("~/.gemini/antigravity-cli/codex-review-gate")
 GLOBAL_CONFIG_PATH = os.path.join(STATE_ROOT, "global-config.json")
 WORKSPACES_DIR = os.path.join(STATE_ROOT, "workspaces")
 
+DEFAULT_CODEX_MODEL = "gpt-6.1-sol"
+
 EDIT_TOOLS = {
     "write_file",
     "edit_file",
@@ -52,6 +54,14 @@ If the previous turn was only a status update, a summary, a setup/login check, a
 Challenge whether that specific work and its design choices should ship.
 
 {agent_response_block}
+
+<turn_actions>
+{turn_actions_block}
+</turn_actions>
+
+<repository_git_context>
+{git_context_block}
+</repository_git_context>
 </task>
 
 <compact_output_contract>
@@ -92,6 +102,10 @@ Check for:
 3. Simpler or more principled alternatives to the current design
 
 Write your review report clearly in Korean (한국어), citing specific file paths and line numbers.
+
+<repository_git_context>
+{git_context_block}
+</repository_git_context>
 """
 
 
@@ -141,20 +155,33 @@ def _workspace_state_file(workspace_root):
     return os.path.join(WORKSPACES_DIR, f"{slug}-{digest}.json")
 
 
+def _normalize_model(model_value):
+    val = str(model_value or "").strip()
+    return val if val else None
+
+
 def load_global_config():
     if not os.path.exists(GLOBAL_CONFIG_PATH):
-        return {"stopReviewGate": False}
+        return {"stopReviewGate": False, "model": DEFAULT_CODEX_MODEL}
     try:
         with open(GLOBAL_CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {"stopReviewGate": bool(data.get("stopReviewGate", False))}
+        return {
+            "stopReviewGate": bool(data.get("stopReviewGate", False)),
+            "model": _normalize_model(data.get("model")) or DEFAULT_CODEX_MODEL,
+        }
     except Exception:
-        return {"stopReviewGate": False}
+        return {"stopReviewGate": False, "model": DEFAULT_CODEX_MODEL}
 
 
-def save_global_config(enabled):
+def save_global_config(enabled, model=None):
     os.makedirs(STATE_ROOT, exist_ok=True)
-    data = {"stopReviewGate": bool(enabled)}
+    current = load_global_config()
+    norm_model = _normalize_model(model) or current.get("model") or DEFAULT_CODEX_MODEL
+    data = {
+        "stopReviewGate": bool(enabled),
+        "model": norm_model,
+    }
     with open(GLOBAL_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
@@ -162,29 +189,39 @@ def save_global_config(enabled):
 
 
 def get_workspace_review_gate(workspace_root):
-    """Return (effective_enabled, workspace_override_or_none, global_enabled)."""
+    """Return (effective_enabled, workspace_override_or_none, global_enabled, model)."""
     global_cfg = load_global_config()
     global_enabled = bool(global_cfg.get("stopReviewGate", False))
+    model = _normalize_model(global_cfg.get("model")) or DEFAULT_CODEX_MODEL
     state_file = _workspace_state_file(workspace_root)
     if os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            ws_model = _normalize_model(data.get("model"))
+            if ws_model:
+                model = ws_model
             if isinstance(data.get("stopReviewGate"), bool):
                 ws_val = data["stopReviewGate"]
-                return ws_val, ws_val, global_enabled
+                return ws_val, ws_val, global_enabled, model
         except Exception:
             pass
-    return global_enabled, None, global_enabled
+    return global_enabled, None, global_enabled, model
 
 
-def set_workspace_review_gate(workspace_root, enabled):
+def set_workspace_review_gate(workspace_root, enabled=None, model=None):
     os.makedirs(WORKSPACES_DIR, exist_ok=True)
     state_file = _workspace_state_file(workspace_root)
+    _, ws_override, _, current_model = get_workspace_review_gate(workspace_root)
+    norm_model = _normalize_model(model) or current_model or DEFAULT_CODEX_MODEL
     data = {
         "workspaceRoot": workspace_root,
-        "stopReviewGate": bool(enabled),
+        "model": norm_model,
     }
+    if enabled is not None:
+        data["stopReviewGate"] = bool(enabled)
+    elif ws_override is not None:
+        data["stopReviewGate"] = bool(ws_override)
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
@@ -245,9 +282,10 @@ def _inspect_antigravity_turn(transcript_path):
     """
     Inspect transcript.jsonl to determine if the latest turn (since last USER_INPUT
     or last [Codex Review Gate] continuation) executed any file edits or shell commands.
+    Returns (has_edits, last_assistant_message, turn_actions_summary).
     """
     if not transcript_path or not os.path.exists(transcript_path):
-        return True, ""
+        return True, "", "No transcript available."
 
     try:
         steps = []
@@ -269,12 +307,14 @@ def _inspect_antigravity_turn(transcript_path):
                 step.get("type") == "USER_INPUT"
                 or step.get("source") == "USER_EXPLICIT"
                 or "[Codex Review Gate]" in content
+                or "[Opus Review Gate]" in content
             ):
                 turn_start_idx = i + 1
                 break
 
         has_edits = False
         last_assistant_message = ""
+        actions = []
 
         for step in steps[turn_start_idx:]:
             if step.get("type") == "PLANNER_RESPONSE" and step.get("content"):
@@ -287,17 +327,73 @@ def _inspect_antigravity_turn(transcript_path):
                 if not isinstance(tc, dict):
                     continue
                 name = str(tc.get("name") or "")
+                args = tc.get("args") or {}
                 if name in EDIT_TOOLS:
                     has_edits = True
+                    target = (
+                        args.get("Path")
+                        or args.get("TargetFile")
+                        or args.get("File")
+                        or ""
+                    )
+                    actions.append(f"- {name}: {target}")
                 elif name == "run_command":
-                    args = tc.get("args") or {}
                     cmd = str(args.get("CommandLine") or "")
-                    if "codex-review-gate.py" not in cmd and "codex-companion.mjs" not in cmd:
+                    if (
+                        "codex-review-gate.py" not in cmd
+                        and "opus-review-gate.py" not in cmd
+                        and "codex-companion.mjs" not in cmd
+                    ):
                         has_edits = True
+                        actions.append(f"- run_command: {cmd[:300]}")
 
-        return has_edits, last_assistant_message
+        turn_actions_summary = "\n".join(actions) if actions else "None"
+        return has_edits, last_assistant_message, turn_actions_summary
     except Exception:
-        return True, ""
+        return True, "", "Error reading transcript."
+
+
+def _collect_git_context(workspace_root, base_ref=None, max_chars=24000):
+    """Collect bounded git status and git diff (excluding .env files) for the review prompt."""
+    parts = []
+    try:
+        st = subprocess.run(
+            ["git", "-C", workspace_root, "status", "--short", "--untracked-files=all"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if st.returncode == 0 and st.stdout.strip():
+            parts.append("git status --short:\n" + st.stdout.strip()[:4000])
+    except Exception:
+        pass
+
+    diff_cmd = ["git", "-C", workspace_root, "diff"]
+    if base_ref:
+        diff_cmd.append(f"{base_ref}...HEAD")
+    else:
+        diff_cmd.append("HEAD")
+    diff_cmd.extend(["--", ".", ":(exclude)**/.env*", ":(exclude).env*"])
+
+    try:
+        df = subprocess.run(
+            diff_cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if df.returncode == 0 and df.stdout.strip():
+            diff_text = df.stdout.strip()
+            if len(diff_text) > max_chars:
+                diff_text = diff_text[:max_chars] + "\n... [diff truncated]"
+            label = f"git diff {base_ref}...HEAD" if base_ref else "git diff HEAD"
+            parts.append(f"{label}:\n{diff_text}")
+    except Exception:
+        pass
+
+    return "\n\n".join(parts) if parts else "No git changes detected in working tree."
 
 
 def _parse_stop_review_output(raw_text):
@@ -359,7 +455,7 @@ def run_stop_hook():
     workspace_root = _resolve_workspace_root(cwd)
 
     # 1. Fast-path: check if review gate is enabled (default is False)
-    enabled, _, _ = get_workspace_review_gate(workspace_root)
+    enabled, _, _, model = get_workspace_review_gate(workspace_root)
     if not enabled:
         sys.stdout.write("{}\n")
         return
@@ -372,7 +468,7 @@ def run_stop_hook():
 
     # 3. Fast-path: check transcript.jsonl to see if any edits/commands happened in this turn
     transcript_path = payload.get("transcriptPath")
-    has_edits, last_assistant_msg = _inspect_antigravity_turn(transcript_path)
+    has_edits, last_assistant_msg, turn_actions_block = _inspect_antigravity_turn(transcript_path)
     if not has_edits:
         sys.stdout.write("{}\n")
         return
@@ -385,11 +481,16 @@ def run_stop_hook():
         return
 
     response_block = (
-        f"Previous Agent response:\n{last_assistant_msg.strip()}"
+        f"Previous Agent response:\n{last_assistant_msg.strip()[:8000]}"
         if last_assistant_msg.strip()
-        else ""
+        else "Previous Agent response: (empty)"
     )
-    prompt = STOP_REVIEW_PROMPT_TEMPLATE.format(agent_response_block=response_block)
+    git_context_block = _collect_git_context(workspace_root, max_chars=24000)
+    prompt = STOP_REVIEW_PROMPT_TEMPLATE.format(
+        agent_response_block=response_block,
+        turn_actions_block=turn_actions_block,
+        git_context_block=git_context_block,
+    )
 
     fd, out_file = tempfile.mkstemp(prefix="agy-codex-gate-", suffix=".txt")
     os.close(fd)
@@ -397,6 +498,8 @@ def run_stop_hook():
         cmd = [
             codex_bin,
             "exec",
+            "-m",
+            model,
             "-s",
             "read-only",
             "--ephemeral",
@@ -420,19 +523,20 @@ def run_stop_hook():
             with open(out_file, "r", encoding="utf-8", errors="replace") as f:
                 raw_output = f.read()
 
-        ok, reason = _parse_stop_review_output(raw_output)
-        if not ok:
-            sys.stdout.write(
-                json.dumps(
-                    {
-                        "decision": "continue",
-                        "reason": reason,
-                    },
-                    ensure_ascii=False,
+        if raw_output.strip():
+            ok, reason = _parse_stop_review_output(raw_output)
+            if not ok:
+                sys.stdout.write(
+                    json.dumps(
+                        {
+                            "decision": "continue",
+                            "reason": reason,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            return
+                return
     except Exception:
         pass
     finally:
@@ -453,24 +557,35 @@ def cmd_setup(args):
         sys.stderr.write("Error: Choose either --enable-review-gate or --disable-review-gate.\n")
         sys.exit(1)
 
+    req_model = _normalize_model(args.model)
+
     if args.enable_review_gate:
         if args.global_scope:
-            save_global_config(True)
-            set_workspace_review_gate(workspace_root, True)
+            save_global_config(True, model=req_model)
+            set_workspace_review_gate(workspace_root, True, model=req_model)
             actions.append(f"전역 및 현재 워크스페이스({workspace_root})의 Codex Stop Review Gate를 활성화했습니다.")
         else:
-            set_workspace_review_gate(workspace_root, True)
+            set_workspace_review_gate(workspace_root, True, model=req_model)
             actions.append(f"현재 워크스페이스({workspace_root})의 Codex Stop Review Gate를 활성화했습니다.")
     elif args.disable_review_gate:
         if args.global_scope:
-            save_global_config(False)
-            set_workspace_review_gate(workspace_root, False)
+            save_global_config(False, model=req_model)
+            set_workspace_review_gate(workspace_root, False, model=req_model)
             actions.append(f"전역 및 현재 워크스페이스({workspace_root})의 Codex Stop Review Gate를 비활성화했습니다.")
         else:
-            set_workspace_review_gate(workspace_root, False)
+            set_workspace_review_gate(workspace_root, False, model=req_model)
             actions.append(f"현재 워크스페이스({workspace_root})의 Codex Stop Review Gate를 비활성화했습니다.")
+    elif req_model:
+        _, ws_override_now, global_now, _ = get_workspace_review_gate(workspace_root)
+        if args.global_scope:
+            save_global_config(global_now, model=req_model)
+            set_workspace_review_gate(workspace_root, enabled=ws_override_now, model=req_model)
+            actions.append(f"전역 및 현재 워크스페이스({workspace_root})의 Codex 리뷰 모델을 {req_model}(으)로 설정했습니다.")
+        else:
+            set_workspace_review_gate(workspace_root, enabled=ws_override_now, model=req_model)
+            actions.append(f"현재 워크스페이스({workspace_root})의 Codex 리뷰 모델을 {req_model}(으)로 설정했습니다.")
 
-    eff_enabled, ws_override, global_enabled = get_workspace_review_gate(workspace_root)
+    eff_enabled, ws_override, global_enabled, model = get_workspace_review_gate(workspace_root)
     codex_info = _check_codex_status(env)
 
     report = {
@@ -479,6 +594,7 @@ def cmd_setup(args):
         "reviewGateEnabled": eff_enabled,
         "workspaceOverride": ws_override,
         "globalReviewGateEnabled": global_enabled,
+        "model": model,
         "codex": codex_info,
         "actionsTaken": actions,
     }
@@ -491,6 +607,7 @@ def cmd_setup(args):
         for act in actions:
             print(f"- {act}")
         print(f"- Stop Review Gate 상태: {status_str} (전역 기본값: {'ON' if global_enabled else 'OFF'})")
+        print(f"- 리뷰 모델: {model}")
         print(f"- Codex CLI: {codex_info.get('version') or '미설치'} ({codex_info.get('binary') or 'N/A'})")
         print(f"- 인증 상태: {codex_info.get('authDetail')}")
 
@@ -502,7 +619,9 @@ def cmd_review(args):
         sys.stderr.write("Codex CLI를 찾을 수 없습니다.\n")
         sys.exit(1)
     workspace_root = _resolve_workspace_root(args.cwd)
-    cmd = [codex_bin, "-C", workspace_root, "review"]
+    _, _, _, cfg_model = get_workspace_review_gate(workspace_root)
+    model = _normalize_model(args.model) or cfg_model or DEFAULT_CODEX_MODEL
+    cmd = [codex_bin, "-C", workspace_root, "review", "-c", f"model={json.dumps(model)}"]
     if args.base:
         cmd.extend(["--base", args.base])
     else:
@@ -518,11 +637,19 @@ def cmd_adversarial_review(args):
         sys.stderr.write("Codex CLI를 찾을 수 없습니다.\n")
         sys.exit(1)
     workspace_root = _resolve_workspace_root(args.cwd)
+    _, _, _, cfg_model = get_workspace_review_gate(workspace_root)
+    model = _normalize_model(args.model) or cfg_model or DEFAULT_CODEX_MODEL
     focus = " ".join(args.focus).strip() if args.focus else "특정 포커스 지정 없음 (전반적인 설계 및 엣지 케이스 검증)"
-    prompt = ADVERSARIAL_REVIEW_PROMPT_TEMPLATE.format(focus=focus)
+    git_context_block = _collect_git_context(workspace_root, max_chars=40000)
+    prompt = ADVERSARIAL_REVIEW_PROMPT_TEMPLATE.format(
+        focus=focus,
+        git_context_block=git_context_block,
+    )
     cmd = [
         codex_bin,
         "exec",
+        "-m",
+        model,
         "-s",
         "read-only",
         "--ephemeral",
@@ -547,14 +674,17 @@ def main():
     p_setup.add_argument("--enable-review-gate", action="store_true")
     p_setup.add_argument("--disable-review-gate", action="store_true")
     p_setup.add_argument("--global", dest="global_scope", action="store_true")
+    p_setup.add_argument("--model", default=None, help=f"Override review model (default: {DEFAULT_CODEX_MODEL})")
     p_setup.add_argument("--cwd", default=None)
     p_setup.add_argument("--json", action="store_true")
 
     p_rev = sub.add_parser("review", help="Run non-interactive Codex code review")
     p_rev.add_argument("--base", default=None)
+    p_rev.add_argument("--model", default=None, help=f"Override review model (default: {DEFAULT_CODEX_MODEL})")
     p_rev.add_argument("--cwd", default=None)
 
     p_adv = sub.add_parser("adversarial-review", help="Run adversarial design/code review")
+    p_adv.add_argument("--model", default=None, help=f"Override review model (default: {DEFAULT_CODEX_MODEL})")
     p_adv.add_argument("--cwd", default=None)
     p_adv.add_argument("focus", nargs="*")
 

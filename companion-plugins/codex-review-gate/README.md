@@ -1,8 +1,10 @@
 # Codex Review Gate Plugin for Antigravity (`agy`)
 
-OpenAI Codex stop-time review gate (`Stop` hook) and on-demand code/adversarial review plugin for Antigravity (`agy`).
+OpenAI Codex (`gpt-6.1-sol` by default) stop-time review gate (`Stop` hook) and on-demand code/adversarial review plugin for Antigravity (`agy`).
 
 ## Key Features
+- **Default Model `gpt-6.1-sol` (`--model` Override Supported)**:
+  - Uses `gpt-6.1-sol` by default to preserve `gpt-6-astra` quota while maintaining strong review quality.
 - **Disabled by Default (`reviewGateEnabled: false`)**:
   - Zero overhead until explicitly enabled for a workspace (or globally) via toggle command.
 - **0ms Q&A Turn Fast-Path (`transcript.jsonl` Inspection)**:
