@@ -141,6 +141,8 @@ Call `ask_question` with `is_multi_select: true` so the user can choose which fo
 
 Execute **only** the actions selected by the user (e.g., staging & committing changes, editing `GEMINI.md`/`CLAUDE.md`/`context.md`, or creating a new `SKILL.md` under `~/.gemini/config/skills/` or `.agents/skills/`).
 
+Once the selected actions are completed (or if the user selected Skip), include the completion marker `<!-- SESSION_WRAP_COMPLETE -->` on the last line of your final response so the pre-compact hook (`pre-compact-wrap.py`) can automatically trigger context compaction when running in pre-compact mode.
+
 ---
 
 ## Quick Reference

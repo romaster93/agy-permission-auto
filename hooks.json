@@ -12,5 +12,21 @@
         ]
       }
     ]
+  },
+  "pre-compact-wrap": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./pre-compact-wrap.py post-invocation",
+        "timeout": 30
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./pre-compact-wrap.py stop",
+        "timeout": 30
+      }
+    ]
   }
 }

@@ -9,7 +9,7 @@ mkdir -p ~/.gemini/config/plugins
 git clone https://github.com/romaster93/agy-permission-auto.git ~/.gemini/config/plugins/permission-reviewer
 ```
 
-설치 후 `agy`를 실행하면 첫 도구 호출 시 자동으로 `~/.gemini/antigravity-cli/settings.json`에 `permissions.allow` 와일드카드 권한(`command(*)`, `write_file(*)` 등), **컨텍스트 50%(`512K`) 자동 압축 설정(`"contextWindow": "512K"`, `~/.bashrc`의 `AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"`)**, 그리고 **하단 상태 표시줄 HUD(`statusLine` → `~/.local/bin/agy-statusline.sh`)**를 부트스트랩하여, `agy` 내장 Auto mode 심사기가 불필요하게 재차 확인창을 띄우지 않고 **본 플러그인(`auto_approve` / `force_ask`)이 전권을 위임받아 심사**하도록 설정됩니다.
+설치 후 `agy`를 실행하면 첫 도구 호출 시 자동으로 `~/.gemini/antigravity-cli/settings.json`에 `permissions.allow` 와일드카드 권한(`command(*)`, `write_file(*)` 등), **컨텍스트 50% 도달 시 자동 `session-wrap` 실행 후 즉시 컴팩션(`pre-compact-wrap.py` + `"contextWindow": "1M"`, `~/.bashrc`의 `AGY_CLI_AUTO_COMPACT_OVERRIDE="60%"`)**, 그리고 **하단 상태 표시줄 HUD(`statusLine` → `~/.local/bin/agy-statusline.sh`)**를 부트스트랩하여, `agy` 내장 Auto mode 심사기가 불필요하게 재차 확인창을 띄우지 않고 **본 플러그인(`auto_approve` / `force_ask`)이 전권을 위임받아 심사**하도록 설정됩니다.
 
 > **참고**: 처음 설치한 직후 실행 중이던 세션이 있다면, 자동 설정된 `settings.json`이 반영되도록 `agy`를 한 번 재시작해 주세요.
 
@@ -35,6 +35,9 @@ git -C ~/.gemini/config/plugins/permission-reviewer pull
 - **Static Safety Gates**:
   - Blocks automated `.env` and sensitive credential path (`~/.ssh`, `~/.aws`, `~/.gnupg`) reads/edits (prompts user via `force_ask`).
   - Classifies `psql`: read-only `SELECT` queries auto-approved, `DROP` or write queries prompt user via `force_ask`.
+- **Pre-Compact Session Wrap & Auto-Compaction (`pre-compact-wrap.py`)**:
+  - 컨텍스트 사용률이 **50%**에 도달하면(HUD 캐시 및 `transcript.jsonl` 기반 실시간 감지), 컨텍스트가 잘려 나가기 전에 `Stop` 훅에서 자동으로 **`session-wrap` 스킬 워크플로우**(4개 병렬 분석 서브에이전트 → 중복 검증 → 마크다운 리포트 → `ask_question`으로 커밋/문서 반영/자동화 선택)를 먼저 실행합니다.
+  - 사용자가 선택한 마무리 작업 실행이 완료되는 즉시 `PostInvocation` 훅에서 네이티브 `CortexStepCheckpoint` (`{"checkpoint": {"sessionSummary": "..."}}`)를 주입하여, 방금 정리된 세션 리포트를 포함한 채로 **그 자리에서 즉시 컨텍스트 컴팩션**을 수행합니다(하드 안전 한계선은 `AGY_CLI_AUTO_COMPACT_OVERRIDE="60%"`).
 - **Bundled HUD (`hud/agy-statusline.sh`)**:
   - `agy` 하단 상태 표시줄(Status Line HUD)에 현재 활성 모델(`◆ Model`), 컨텍스트 윈도우 사용률(`Ctx [████░░░░] % (In/Out)`), 모델 버킷별 남은 쿼터 및 리셋 타이머(`Quota`)를 실시간으로 표시합니다.
   - `~/.local/bin/agy-statusline.sh` 및 `~/.gemini/antigravity-cli/hud/agy-statusline.sh`로 자동 동기화되며, `claude-usage-monitor` 트레이 앱과 연동할 수 있도록 `~/.gemini/antigravity-cli/hud/cache/last_stdin.json`에 최신 상태 캐시를 기록합니다.
@@ -50,8 +53,9 @@ git -C ~/.gemini/config/plugins/permission-reviewer pull
 ```text
 permission-reviewer/
 ├── plugin.json             # Plugin manifest
-├── hooks.json              # PreToolUse lifecycle hook registration
-├── permission-reviewer.py  # Reviewer script
+├── hooks.json              # PreToolUse, PostInvocation & Stop hook registration
+├── permission-reviewer.py  # Reviewer & bootstrap script
+├── pre-compact-wrap.py     # 50% context pre-compact session-wrap & checkpoint compaction hook
 ├── hud/                    # Bundled Antigravity statusLine HUD (auto-synced)
 │   └── agy-statusline.sh
 ├── skills/                 # Bundled Antigravity skills (auto-loaded & synced)

@@ -6,6 +6,8 @@ import sys
 # claude-usage-monitor reads agy's quota from a verbatim copy of this stdin.
 STATUS_COPY = os.path.expanduser(
     "~/.gemini/antigravity-cli/hud/cache/last_stdin.json")
+SESSIONS_CACHE_DIR = os.path.expanduser(
+    "~/.gemini/antigravity-cli/hud/cache/sessions")
 
 
 def fmt_tokens(n):
@@ -73,6 +75,15 @@ def main():
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(raw)
         os.replace(tmp, STATUS_COPY)
+
+        conv_id = str(data.get("conversation_id") or data.get("session_id") or "").strip()
+        if conv_id and all(c.isalnum() or c in "-_" for c in conv_id):
+            os.makedirs(SESSIONS_CACHE_DIR, exist_ok=True)
+            conv_path = os.path.join(SESSIONS_CACHE_DIR, f"{conv_id}.json")
+            conv_tmp = f"{conv_path}.{os.getpid()}.tmp"
+            with open(conv_tmp, "w", encoding="utf-8") as f:
+                f.write(raw)
+            os.replace(conv_tmp, conv_path)
     except OSError:
         pass
 
