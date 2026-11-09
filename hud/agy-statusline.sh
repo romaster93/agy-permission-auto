@@ -113,9 +113,8 @@ def main():
 
         c = color_by_pct(used_pct, invert=False)
         bar = make_bar(used_pct, width=8)
-        tok_str = f"In:{fmt_tokens(in_tok)} Out:{fmt_tokens(out_tok)}"
-        if win_size:
-            tok_str += f"/{fmt_tokens(win_size)}"
+        in_str = f"{fmt_tokens(in_tok)}/{fmt_tokens(win_size)}" if win_size else fmt_tokens(in_tok)
+        tok_str = f"In:{in_str} Out:{fmt_tokens(out_tok)}"
         parts.append(f"{CYAN}Ctx{RESET} {c}[{bar}] {used_pct:.1f}%{RESET} {DIM}({tok_str}){RESET}")
 
     # 3. Quota info
