@@ -9,7 +9,7 @@ mkdir -p ~/.gemini/config/plugins
 git clone https://github.com/romaster93/agy-permission-auto.git ~/.gemini/config/plugins/permission-reviewer
 ```
 
-설치 후 `agy`를 실행하면 첫 도구 호출 시 자동으로 `~/.gemini/antigravity-cli/settings.json`에 `permissions.allow` 와일드카드 권한(`command(*)`, `write_file(*)` 등)과 **컨텍스트 50%(`512K`) 자동 압축 설정(`"contextWindow": "512K"`, `~/.bashrc`의 `AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"`)**을 부트스트랩하여, `agy` 내장 Auto mode 심사기가 불필요하게 재차 확인창을 띄우지 않고 **본 플러그인(`auto_approve` / `force_ask`)이 전권을 위임받아 심사**하도록 설정됩니다.
+설치 후 `agy`를 실행하면 첫 도구 호출 시 자동으로 `~/.gemini/antigravity-cli/settings.json`에 `permissions.allow` 와일드카드 권한(`command(*)`, `write_file(*)` 등), **컨텍스트 50%(`512K`) 자동 압축 설정(`"contextWindow": "512K"`, `~/.bashrc`의 `AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"`)**, 그리고 **하단 상태 표시줄 HUD(`statusLine` → `~/.local/bin/agy-statusline.sh`)**를 부트스트랩하여, `agy` 내장 Auto mode 심사기가 불필요하게 재차 확인창을 띄우지 않고 **본 플러그인(`auto_approve` / `force_ask`)이 전권을 위임받아 심사**하도록 설정됩니다.
 
 > **참고**: 처음 설치한 직후 실행 중이던 세션이 있다면, 자동 설정된 `settings.json`이 반영되도록 `agy`를 한 번 재시작해 주세요.
 
@@ -35,6 +35,9 @@ git -C ~/.gemini/config/plugins/permission-reviewer pull
 - **Static Safety Gates**:
   - Blocks automated `.env` and sensitive credential path (`~/.ssh`, `~/.aws`, `~/.gnupg`) reads/edits (prompts user via `force_ask`).
   - Classifies `psql`: read-only `SELECT` queries auto-approved, `DROP` or write queries prompt user via `force_ask`.
+- **Bundled HUD (`hud/agy-statusline.sh`)**:
+  - `agy` 하단 상태 표시줄(Status Line HUD)에 현재 활성 모델(`◆ Model`), 컨텍스트 윈도우 사용률(`Ctx [████░░░░] % (In/Out)`), 모델 버킷별 남은 쿼터 및 리셋 타이머(`Quota`)를 실시간으로 표시합니다.
+  - `~/.local/bin/agy-statusline.sh` 및 `~/.gemini/antigravity-cli/hud/agy-statusline.sh`로 자동 동기화되며, `claude-usage-monitor` 트레이 앱과 연동할 수 있도록 `~/.gemini/antigravity-cli/hud/cache/last_stdin.json`에 최신 상태 캐시를 기록합니다.
 - **Bundled Skills (`skills/`)**:
   - **`motivation-not-novelty`**: 연구/논문 작성 시 단순 현상 관찰(Motivation)에서 근본 원인 진단·방법론 도출·필수성 입증(Novelty)으로 끌어올리는 가이드라인 스킬
   - **`session-wrap`**: 세션 종료 전 4개의 병렬 분석 서브에이전트(`Doc Updater`, `Automation Scout`, `Learning Extractor`, `Follow-up Suggester`) + 중복 검증 서브에이전트(`Duplicate Checker`)를 실행하여 문서화·자동화·TIL·후속 작업을 정리하는 워크플로우 스킬
@@ -49,6 +52,8 @@ permission-reviewer/
 ├── plugin.json             # Plugin manifest
 ├── hooks.json              # PreToolUse lifecycle hook registration
 ├── permission-reviewer.py  # Reviewer script
+├── hud/                    # Bundled Antigravity statusLine HUD (auto-synced)
+│   └── agy-statusline.sh
 ├── skills/                 # Bundled Antigravity skills (auto-loaded & synced)
 │   ├── motivation-not-novelty/
 │   │   └── SKILL.md

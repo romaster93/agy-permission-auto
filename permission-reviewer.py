@@ -230,7 +230,7 @@ def _sync_managed_tree(src_dir, dst_dir):
                     try:
                         with os.fdopen(fd, "wb") as tf:
                             tf.write(src_bytes)
-                        if fname.endswith(".py"):
+                        if fname.endswith((".py", ".sh")):
                             os.chmod(tmp_file, 0o755)
                         else:
                             os.chmod(tmp_file, 0o644)
@@ -243,7 +243,7 @@ def _sync_managed_tree(src_dir, dst_dir):
                         except Exception:
                             pass
                         raise
-                elif fname.endswith(".py") and os.name != "nt":
+                elif fname.endswith((".py", ".sh")) and os.name != "nt":
                     st_mode = os.stat(dst_file).st_mode
                     if not (st_mode & 0o111):
                         os.chmod(dst_file, st_mode | 0o755)
@@ -259,8 +259,28 @@ def ensure_cli_permissions_allow():
          classifier defers to this PreToolUse hook (`auto_approve` vs `force_ask`).
       2. `"contextWindow": "512K"` so 1M context models (like Gemini 4 Argon) compact
          at ~50% (512K) instead of the default 20% (256K).
-    Also ensures ~/.bashrc exports `AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"` on POSIX systems.
+      3. `"statusLine"` HUD configuration pointing to the bundled `agy-statusline.sh`.
+    Also ensures ~/.bashrc exports `AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"` on POSIX systems,
+    and syncs bundled HUD, skills, and companion plugins.
     """
+    plugin_root_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Sync bundled HUD script (hud/agy-statusline.sh) before bootstrapping settings.json
+    try:
+        plugin_hud_dir = os.path.join(plugin_root_dir, "hud")
+        global_hud_dir = os.path.expanduser("~/.gemini/antigravity-cli/hud")
+        if os.path.isdir(plugin_hud_dir):
+            cnt = _sync_managed_tree(plugin_hud_dir, global_hud_dir)
+            if cnt > 0:
+                _log(f"Synced HUD to {global_hud_dir} ({cnt} files updated)")
+            if os.name != "nt":
+                local_bin_dir = os.path.expanduser("~/.local/bin")
+                cnt_bin = _sync_managed_tree(plugin_hud_dir, local_bin_dir)
+                if cnt_bin > 0:
+                    _log(f"Synced HUD to {local_bin_dir} ({cnt_bin} files updated)")
+    except Exception as e:
+        _log(f"ensure_cli_permissions_allow HUD sync error: {e}")
+
     settings_path = os.path.expanduser("~/.gemini/antigravity-cli/settings.json")
     try:
         data = {}
@@ -288,6 +308,20 @@ def ensure_cli_permissions_allow():
             data["contextWindow"] = "512K"
             changed = True
 
+        status_line = data.get("statusLine")
+        if not isinstance(status_line, dict) or not status_line.get("command"):
+            if os.name == "nt":
+                win_hud_script = os.path.expanduser("~/.gemini/antigravity-cli/hud/agy-statusline.sh")
+                default_hud_cmd = f'python "{win_hud_script}"'
+            else:
+                default_hud_cmd = os.path.expanduser("~/.local/bin/agy-statusline.sh")
+            data["statusLine"] = {
+                "type": "command",
+                "command": default_hud_cmd,
+                "stack_with_default": True,
+            }
+            changed = True
+
         if changed:
             os.makedirs(os.path.dirname(settings_path), exist_ok=True)
             tmp_path = settings_path + ".tmp"
@@ -297,7 +331,8 @@ def ensure_cli_permissions_allow():
             os.replace(tmp_path, settings_path)
             _log(
                 f"Bootstrapped {settings_path}: added_allow={missing}, "
-                f"contextWindow={data.get('contextWindow')}"
+                f"contextWindow={data.get('contextWindow')}, "
+                f"statusLine={data.get('statusLine')}"
             )
     except Exception as e:
         _log(f"ensure_cli_permissions_allow settings error: {e}")
@@ -319,7 +354,6 @@ def ensure_cli_permissions_allow():
 
     # Sync bundled plugin skills into ~/.gemini/config/skills/
     try:
-        plugin_root_dir = os.path.dirname(os.path.abspath(__file__))
         plugin_skills_dir = os.path.join(plugin_root_dir, "skills")
         global_skills_dir = os.path.expanduser("~/.gemini/config/skills")
         if os.path.isdir(plugin_skills_dir):
