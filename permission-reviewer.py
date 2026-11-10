@@ -257,11 +257,12 @@ def ensure_cli_permissions_allow():
     Ensure ~/.gemini/antigravity-cli/settings.json contains:
       1. wildcard allow rules (`permissions.allow`) so that agy's built-in Auto mode
          classifier defers to this PreToolUse hook (`auto_approve` vs `force_ask`).
-      2. `"contextWindow": "1M"` so `pre-compact-wrap.py` can trigger `session-wrap`
-         at 50% and inject a compaction checkpoint right after wrap finishes, while
-         `AGY_CLI_AUTO_COMPACT_OVERRIDE="60%"` acts as the hard safety ceiling.
+      2. `"contextWindow": "1M"` so `pre-compact-wrap.py` can suggest `session-wrap`
+         at 60% and 70%, force-run `session-wrap` at 90%, and inject a compaction
+         checkpoint right after wrap finishes, while `AGY_CLI_AUTO_COMPACT_OVERRIDE="95%"`
+         acts as the hard safety ceiling.
       3. `"statusLine"` HUD configuration pointing to the bundled `agy-statusline.sh`.
-    Also ensures ~/.bashrc exports `AGY_CLI_AUTO_COMPACT_OVERRIDE="60%"` on POSIX systems,
+    Also ensures ~/.bashrc exports `AGY_CLI_AUTO_COMPACT_OVERRIDE="95%"` on POSIX systems,
     and syncs bundled HUD, skills, and companion plugins.
     """
     plugin_root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -357,16 +358,18 @@ def ensure_cli_permissions_allow():
                     with open(bashrc_path, "a", encoding="utf-8") as f:
                         if content and not content.endswith("\n"):
                             f.write("\n")
-                        f.write('export AGY_CLI_AUTO_COMPACT_OVERRIDE="60%"\n')
-                    _log(f"Bootstrapped AGY_CLI_AUTO_COMPACT_OVERRIDE=60% in {bashrc_path}")
-                elif 'export AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"' in content:
-                    updated_content = content.replace(
-                        'export AGY_CLI_AUTO_COMPACT_OVERRIDE="50%"',
-                        'export AGY_CLI_AUTO_COMPACT_OVERRIDE="60%"',
+                        f.write('export AGY_CLI_AUTO_COMPACT_OVERRIDE="95%"\n')
+                    _log(f"Bootstrapped AGY_CLI_AUTO_COMPACT_OVERRIDE=95% in {bashrc_path}")
+                else:
+                    updated_content = re.sub(
+                        r'export\s+AGY_CLI_AUTO_COMPACT_OVERRIDE="(?:50|60|70|80|85|90)%"',
+                        'export AGY_CLI_AUTO_COMPACT_OVERRIDE="95%"',
+                        content,
                     )
-                    with open(bashrc_path, "w", encoding="utf-8") as f:
-                        f.write(updated_content)
-                    _log(f"Updated AGY_CLI_AUTO_COMPACT_OVERRIDE to 60% in {bashrc_path}")
+                    if updated_content != content:
+                        with open(bashrc_path, "w", encoding="utf-8") as f:
+                            f.write(updated_content)
+                        _log(f"Updated AGY_CLI_AUTO_COMPACT_OVERRIDE to 95% in {bashrc_path}")
         except Exception as e:
             _log(f"ensure_cli_permissions_allow bashrc error: {e}")
 

@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 # ruff: noqa: S110, S603, S607, TRY300
 """
-Antigravity (agy) Pre-Compact Session Wrap & Auto-Compaction Hook.
+Antigravity (agy) 3-Stage Pre-Compact Session Wrap & Auto-Compaction Hook.
 
-Workflow (Option 1 — Interactive Session Wrap before Auto-Compact):
-1. Monitors live context window usage (`used_percentage`) per conversation via the
-   HUD statusline cache (`~/.gemini/antigravity-cli/hud/cache/sessions/<conv_id>.json`
-   and `last_stdin.json`) cross-checked with `transcript.jsonl`.
-2. When context usage reaches >= 50% (configurable via `AGY_AUTO_WRAP_THRESHOLD` or
-   `config.json`), intercepts the `Stop` hook (`fullyIdle == true`) and instructs the
-   agent to execute the interactive `session-wrap` skill (4 parallel analysis subagents
-   -> duplicate check -> Markdown report -> `ask_question` multi-select -> execute
-   selected actions).
-3. Meanwhile, `AGY_CLI_AUTO_COMPACT_OVERRIDE="60%"` provides headroom so `agy`'s
-   built-in hard auto-compact does not prematurely truncate context while `session-wrap`
-   is running.
-4. Once the user answers `ask_question` and the agent finishes executing the selected
-   wrap-up actions (`PostInvocation` hook with no remaining tool calls), immediately
-   injects a native `CortexStepCheckpoint` (`{"checkpoint": {"sessionSummary": "..."}}`)
-   to compact the context window on the spot without waiting for 60%.
+3-Stage Escalation Policy:
+1. 60% Context (1st Suggestion — Non-intrusive):
+   - Does NOT automatically run `session-wrap` or `compact`.
+   - At turn completion (`PostInvocation`), displays a suggestion banner asking if the
+     user wants to run `session-wrap` + `compact`.
+   - If accepted: runs `session-wrap` -> `ask_question` -> executes selected actions ->
+     immediately compacts (`CortexStepCheckpoint` injection).
+   - If declined/ignored: does NEITHER `session-wrap` NOR `compact`, continues working.
+2. 70% Context (2nd Suggestion — Limit Re-Suggestion):
+   - If declined at 60% and context reaches 70%, asks the user AGAIN at 70%.
+   - If accepted: runs `session-wrap` -> executes selected actions -> immediately compacts.
+   - If declined/ignored: does NEITHER `session-wrap` NOR `compact`, continues working.
+3. 90% Context (Forced Auto-Wrap & Auto-Compact):
+   - If declined at 70% and context reaches 90%, does NOT ask — intercepts the `Stop`
+     hook (`{"decision": "continue", ...}`) to automatically run `session-wrap` right
+     away, and as soon as `session-wrap` finishes, immediately compacts the context!
+   - Built-in hard ceiling (`AGY_CLI_AUTO_COMPACT_OVERRIDE`) is set to 95% so `agy`
+     does not prematurely truncate context while the 90% `session-wrap` is running.
 """
 
 import argparse
@@ -37,14 +39,46 @@ LOG_PATH = os.path.expanduser("~/.local/share/agy-pre-compact-wrap.log")
 HUD_LAST_STDIN = os.path.expanduser("~/.gemini/antigravity-cli/hud/cache/last_stdin.json")
 HUD_SESSIONS_DIR = os.path.expanduser("~/.gemini/antigravity-cli/hud/cache/sessions")
 
-DEFAULT_WRAP_THRESHOLD_PCT = 50.0
+DEFAULT_SUGGEST_THRESHOLDS = [60.0, 70.0]
+DEFAULT_FORCE_THRESHOLD_PCT = 90.0
+HARD_SAFETY_CEILING_PCT = 95.0
 DEFAULT_CONTEXT_WINDOW_SIZE = 1_048_576
 SYSTEM_OVERHEAD_TOKENS_ESTIMATE = 45_000
-MAX_WRAP_STEPS = 35
+MAX_WRAP_STEPS = 40
 
-WRAP_TRIGGER_PROMPT_TEMPLATE = """\
-[Auto Pre-Compact Session Wrap] 현재 컨텍스트 윈도우 사용량이 {used_pct:.1f}% (임계값 {threshold_pct:.0f}%)에 도달했습니다.
-컨텍스트 자동 컴팩션(Auto-Compaction)을 실행하기 전에, 지금까지의 세션 작업 내역이 유실되지 않도록 반드시 `session-wrap` 스킬 워크플로우를 지금 바로 진행해 주세요:
+WRAP_SUGGESTION_MODEL_MSG_TEMPLATE = """\
+[Pre-Compact Session Wrap Suggestion ({tier_label}: {tier_pct:.0f}%)]
+Context window usage is currently {used_pct:.1f}% (suggestion tier: {tier_pct:.0f}%, {next_tier_note}).
+A suggestion banner was just shown to the user asking if they want to run `session-wrap` and compact now.
+- If the user's next message agrees to wrap (e.g., "응", "어", "그래", "진행해", "해줘", "wrap", "wrap 해줘", "/wrap", "/session-wrap", "세션 정리"), immediately execute the full `session-wrap` skill workflow:
+  1. Check `git status --short` and `git diff --stat`
+  2. Launch the 4 parallel `research` subagents (`Doc Updater`, `Automation Scout`, `Learning Extractor`, `Follow-up Suggester`)
+  3. Validate duplicates and present `## Session Wrap Analysis Results`
+  4. Call `ask_question` (`is_multi_select: true`) so the user can select which wrap-up actions to execute
+  5. Execute the selected actions and include `<!-- SESSION_WRAP_COMPLETE -->` on the last line of your final response so automatic context compaction runs immediately.
+- If the user explicitly asks to compact ONLY without session-wrap (e.g., "compact만 해줘", "wrap 말고 compact만"), briefly summarize the session in your response and include `<!-- COMPACT_ONLY_COMPLETE -->` on the last line.
+- If the user declines (e.g., "아니", "안해", "그냥 진행해", "나중에") or gives a normal task instruction, do NEITHER `session-wrap` NOR `compact`. Simply acknowledge briefly (if they said "아니") or execute their task instruction normally.\
+"""
+
+WRAP_SUGGESTION_USER_MARKDOWN_60 = """
+> 💡 **[Context {used_pct:.1f}% 도달 — Session Wrap 1차 제안 (60%)]**
+> 현재 컨텍스트 사용량이 **60%**를 넘었습니다. 지금 `session-wrap` 진행 후 컴팩션할까요?
+> - **수락 (Wrap + Compact)**: **`응`** 또는 **`wrap 해줘`** 입력 (`session-wrap` 완료 직후 자동 컴팩션)
+> - **거절 (계속 작업)**: **`아니`** 입력 또는 다음 작업 지시 입력 → **Wrap·Compact 모두 하지 않고 계속 작업**하며, 한도 **70%** 도달 시 다시 물어봅니다.
+"""
+
+WRAP_SUGGESTION_USER_MARKDOWN_70 = """
+> ⚠️ **[Context {used_pct:.1f}% 한도 도달 — Session Wrap 2차 제안 ({tier_pct:.0f}%)]**
+> 컨텍스트 사용량이 **{tier_pct:.0f}%**에 도달했습니다. 지금 `session-wrap` 진행 후 컴팩션할까요?
+> - **수락 (Wrap + Compact)**: **`응`** 또는 **`wrap 해줘`** 입력 (`session-wrap` 완료 직후 즉시 컴팩션)
+> - **Compact만 진행**: **`compact만 해줘`** 입력 (`session-wrap` 없이 즉시 컴팩션)
+> - **거절 (계속 작업)**: **`아니`** 입력 또는 다음 작업 지시 입력 → **Wrap·Compact 모두 하지 않고 계속 작업**하며, **{force_pct:.0f}%** 도달 시에는 묻지 않고 자동으로 Wrap 후 Compact가 실행됩니다.
+"""
+
+FORCE_WRAP_90_PROMPT_TEMPLATE = """\
+[Auto Pre-Compact Session Wrap — {force_pct:.0f}% 도달 자동 실행]
+현재 컨텍스트 윈도우 사용량이 {used_pct:.1f}% (강제 실행 임계값 {force_pct:.0f}%)에 도달했습니다.
+60% 및 70% 제안 이후 컨텍스트가 90%에 도달했으므로, 컨텍스트 유실 방지를 위해 사용자에게 추가로 묻지 않고 지금 즉시 `session-wrap` 스킬 워크플로우를 실행해 주세요:
 
 1. **Git 상태 확인**: `run_command`로 `git status --short` 및 `git diff --stat`를 확인하세요.
 2. **Phase 1 — 4개 분석 서브에이전트 병렬 실행**: `invoke_subagent` (`TypeName: "research"`, `Model: "inherit"`)로 다음 4개를 한 턴에 병렬 호출하세요:
@@ -104,7 +138,8 @@ def _atomic_write_json(path, data):
 def load_config():
     cfg = {
         "enabled": True,
-        "thresholdPct": DEFAULT_WRAP_THRESHOLD_PCT,
+        "suggestThresholdsPct": list(DEFAULT_SUGGEST_THRESHOLDS),
+        "forceThresholdPct": DEFAULT_FORCE_THRESHOLD_PCT,
     }
     try:
         if os.path.isfile(CONFIG_PATH):
@@ -115,21 +150,24 @@ def load_config():
     except Exception as e:
         _log(f"load_config error: {e}")
 
-    env_thresh = os.environ.get("AGY_AUTO_WRAP_THRESHOLD", "").strip().rstrip("%").strip()
-    if env_thresh:
-        try:
-            val = float(env_thresh)
-            if 5.0 <= val <= 95.0:
-                cfg["thresholdPct"] = val
-        except ValueError:
-            pass
+    raw_list = cfg.get("suggestThresholdsPct")
+    if not isinstance(raw_list, list) or not raw_list:
+        cfg["suggestThresholdsPct"] = list(DEFAULT_SUGGEST_THRESHOLDS)
+    else:
+        cfg["suggestThresholdsPct"] = sorted(float(x) for x in raw_list)
+
+    force_val = cfg.get("forceThresholdPct", DEFAULT_FORCE_THRESHOLD_PCT)
+    try:
+        cfg["forceThresholdPct"] = float(force_val)
+    except (TypeError, ValueError):
+        cfg["forceThresholdPct"] = DEFAULT_FORCE_THRESHOLD_PCT
     return cfg
 
 
 def load_conv_state(conv_id):
     safe = _safe_id(conv_id)
     if not safe:
-        return {"status": "idle"}
+        return {"status": "idle", "last_suggested_tier": 0.0}
     path = os.path.join(STATE_DIR, f"{safe}.json")
     try:
         if os.path.isfile(path):
@@ -139,7 +177,7 @@ def load_conv_state(conv_id):
                 return data
     except Exception as e:
         _log(f"load_conv_state error ({conv_id}): {e}")
-    return {"status": "idle"}
+    return {"status": "idle", "last_suggested_tier": 0.0}
 
 
 def save_conv_state(conv_id, state):
@@ -176,7 +214,7 @@ def is_subagent_or_internal(payload):
 
 
 def parse_transcript(transcript_path):
-    """Parse transcript.jsonl and return list of step dicts sorted by step_index."""
+    """Parse transcript.jsonl and return list of step dicts."""
     steps = []
     if not transcript_path or not os.path.isfile(transcript_path):
         return steps
@@ -272,7 +310,6 @@ def get_context_usage_info(conv_id, steps, state):
     state_compacted_idx = int(state.get("last_compacted_step_idx", -1))
     last_checkpoint_step_idx = max(transcript_checkpoint_idx, state_compacted_idx)
 
-    # Find latest PLANNER_RESPONSE after the last checkpoint
     latest_planner = None
     for s in reversed(steps):
         idx = int(s.get("step_index", -1))
@@ -282,7 +319,6 @@ def get_context_usage_info(conv_id, steps, state):
             latest_planner = s
             break
 
-    # If no model response has occurred since the last compaction, context is freshly compacted
     if latest_planner is None and last_checkpoint_step_idx >= 0:
         return (2.0, latest_step_idx, last_checkpoint_step_idx)
 
@@ -299,7 +335,6 @@ def get_context_usage_info(conv_id, steps, state):
                 win_size = int(w)
             compacted_marker = int(ctx.get("_compacted_at_step", -1))
             if compacted_marker < last_checkpoint_step_idx:
-                # HUD cache predates the latest checkpoint
                 hud_used_pct = None
             else:
                 up = ctx.get("used_percentage")
@@ -322,8 +357,6 @@ def get_context_usage_info(conv_id, steps, state):
         )
 
     if hud_used_pct is not None:
-        # If the conversation grew significantly since the HUD snapshot was written,
-        # add the positive token delta so we catch crossing 50% on the exact turn.
         delta_pct = 0.0
         if planner_tokens > hud_cur_tokens > 0 and win_size > 0:
             delta_pct = ((planner_tokens - hud_cur_tokens) / win_size) * 100.0
@@ -337,38 +370,34 @@ def get_context_usage_info(conv_id, steps, state):
     return (used_pct, latest_step_idx, last_checkpoint_step_idx)
 
 
-def analyze_wrap_progress(steps, trigger_step_idx, model_output=""):
+def analyze_wrap_progress(steps, since_step_idx, model_output=""):
     """
-    Inspect steps after `trigger_step_idx` to determine the progress of `session-wrap`.
-    Returns a dict with:
-      - `is_final_planner_step`: True if the last step is PLANNER_RESPONSE with no tool_calls
-      - `ask_question_step_idx`: step_index where `ask_question` was called (> trigger_step_idx), or -1
-      - `user_input_step_idx`: step_index where a new USER_INPUT arrived (> trigger_step_idx), or -1
-      - `last_subagent_step_idx`: step_index where `invoke_subagent` was last called, or -1
-      - `has_wrap_report`: True if `Session Wrap Analysis Results` or equivalent appeared
-      - `has_complete_marker`: True if `SESSION_WRAP_COMPLETE` appeared in the latest response
-      - `wrap_completed`: True if the interactive session-wrap + user action execution is finished
+    Inspect steps after `since_step_idx` to determine whether `session-wrap` (or
+    `compact-only`) was executed and whether its interactive flow has completed.
     """
+    report_step_idx = -1
     ask_question_step_idx = -1
-    user_input_step_idx = -1
+    user_input_after_report_idx = -1
     last_subagent_step_idx = -1
     has_wrap_report = False
 
     for s in steps:
         idx = int(s.get("step_index", -1))
-        if idx <= trigger_step_idx:
+        if idx <= since_step_idx:
             continue
         stype = s.get("type", "")
         if stype == "USER_INPUT":
-            user_input_step_idx = idx
+            if has_wrap_report:
+                user_input_after_report_idx = idx
         elif stype == "PLANNER_RESPONSE":
             content = str(s.get("content") or "")
             if (
                 "Session Wrap Analysis Results" in content
-                or "세션 마무리" in content
-                or "Documentation Updates" in content
+                or ("### 1." in content and "Documentation Updates" in content)
             ):
                 has_wrap_report = True
+                if report_step_idx < 0:
+                    report_step_idx = idx
             for tc in s.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
@@ -386,41 +415,42 @@ def analyze_wrap_progress(steps, trigger_step_idx, model_output=""):
     )
     last_content = str(last_step.get("content") or "") + "\n" + str(model_output or "")
     has_complete_marker = "SESSION_WRAP_COMPLETE" in last_content
+    has_compact_only_marker = "COMPACT_ONLY_COMPLETE" in last_content
 
-    # Interactive completion criteria:
-    # 1. Must be at the end of a model response with no pending tool calls in this step.
-    # 2. Either:
-    #    a) `ask_question` was called during wrap AND answered (`last_step_idx > ask_question_step_idx`),
-    #       and no new subagent was spawned after `ask_question`; OR
-    #    b) The user sent a direct follow-up `USER_INPUT` during wrap (`last_step_idx > user_input_step_idx`)
-    #       and no new subagent was spawned after `user_input_step_idx`; OR
-    #    c) Explicit `SESSION_WRAP_COMPLETE` marker is present after the wrap report/question.
-    answered_ask = (
-        ask_question_step_idx > trigger_step_idx
+    answered_ask_after_wrap = (
+        (has_wrap_report or last_subagent_step_idx > since_step_idx or has_complete_marker)
+        and ask_question_step_idx > since_step_idx
         and last_step_idx > ask_question_step_idx
         and last_subagent_step_idx < ask_question_step_idx
     )
-    answered_user_input = (
-        user_input_step_idx > trigger_step_idx
-        and last_step_idx > user_input_step_idx
-        and last_subagent_step_idx < user_input_step_idx
+    answered_text_after_report = (
+        has_wrap_report
+        and user_input_after_report_idx > report_step_idx
+        and last_step_idx > user_input_after_report_idx
+        and last_subagent_step_idx < user_input_after_report_idx
     )
-    marker_after_interaction = has_complete_marker and (
-        answered_ask or answered_user_input or has_wrap_report
+    explicit_marker_completed = (
+        has_complete_marker
+        and (has_wrap_report or ask_question_step_idx > since_step_idx)
     )
 
     wrap_completed = is_final_planner_step and (
-        answered_ask or answered_user_input or marker_after_interaction
+        answered_ask_after_wrap
+        or answered_text_after_report
+        or explicit_marker_completed
+        or has_compact_only_marker
     )
 
     return {
         "is_final_planner_step": is_final_planner_step,
         "last_step_idx": last_step_idx,
+        "report_step_idx": report_step_idx,
         "ask_question_step_idx": ask_question_step_idx,
-        "user_input_step_idx": user_input_step_idx,
+        "user_input_after_report_idx": user_input_after_report_idx,
         "last_subagent_step_idx": last_subagent_step_idx,
         "has_wrap_report": has_wrap_report,
         "has_complete_marker": has_complete_marker,
+        "has_compact_only_marker": has_compact_only_marker,
         "wrap_completed": wrap_completed,
     }
 
@@ -433,7 +463,7 @@ def _extract_user_request_text(raw_content):
     return text
 
 
-def build_checkpoint_session_summary(steps, last_checkpoint_step_idx, trigger_step_idx):
+def build_checkpoint_session_summary(steps, last_checkpoint_step_idx, since_step_idx):
     """
     Synthesize a rich, structured `sessionSummary` for `CortexStepCheckpoint` from:
     1. User requests since the last checkpoint
@@ -459,8 +489,12 @@ def build_checkpoint_session_summary(steps, last_checkpoint_step_idx, trigger_st
                 user_requests.append(f"- [Step {idx}] {short_req}")
         elif stype == "PLANNER_RESPONSE":
             content = str(s.get("content") or "").strip()
-            cleaned_content = content.replace("<!-- SESSION_WRAP_COMPLETE -->", "").strip()
-            if idx > trigger_step_idx and cleaned_content:
+            cleaned_content = (
+                content.replace("<!-- SESSION_WRAP_COMPLETE -->", "")
+                .replace("<!-- COMPACT_ONLY_COMPLETE -->", "")
+                .strip()
+            )
+            if idx > since_step_idx and cleaned_content:
                 if (
                     "Session Wrap Analysis Results" in cleaned_content
                     or "### 1." in cleaned_content
@@ -534,6 +568,222 @@ def build_checkpoint_session_summary(steps, last_checkpoint_step_idx, trigger_st
     return "\n".join(sections).strip()
 
 
+def _emit_compaction_checkpoint(
+    conv_id,
+    state,
+    steps,
+    latest_step_idx,
+    last_checkpoint_step_idx,
+    since_step_idx,
+    trigger_pct,
+):
+    session_summary = build_checkpoint_session_summary(
+        steps,
+        last_checkpoint_step_idx=last_checkpoint_step_idx,
+        since_step_idx=since_step_idx,
+    )
+    compacted_step_marker = latest_step_idx + 5
+    state["status"] = "idle"
+    state["last_suggested_tier"] = 0.0
+    state["last_compacted_step_idx"] = compacted_step_marker
+    state["last_compacted_at"] = time.time()
+    state["compaction_count"] = int(state.get("compaction_count", 0)) + 1
+    state["cooldown_until_step"] = compacted_step_marker + 4
+    save_conv_state(conv_id, state)
+
+    mark_hud_snapshot_compacted(conv_id, compacted_step_marker)
+
+    _log(
+        f"[PostInvocation] Injected checkpoint compaction after session-wrap "
+        f"(trigger_pct={trigger_pct}%, step={latest_step_idx}, conv={conv_id})"
+    )
+
+    output = {
+        "injectSteps": [
+            {
+                "checkpoint": {
+                    "sessionSummary": session_summary,
+                }
+            },
+            {
+                "systemMessage": {
+                    "systemMessage": "",
+                    "metadata": {
+                        "user_markdown": (
+                            f"\n> 🗜️ **[Pre-Compact Wrap & 컴팩션 완료]** "
+                            f"세션 정리 반영 후 컨텍스트 컴팩션(Checkpoint)이 "
+                            f"자동 실행되었습니다 (트리거 시점: `{trigger_pct}%`).\n"
+                        ),
+                    },
+                }
+            },
+        ]
+    }
+    sys.stdout.write(json.dumps(output, ensure_ascii=False))
+    sys.stdout.flush()
+
+
+def handle_post_invocation(payload):
+    if is_subagent_or_internal(payload):
+        sys.stdout.write("{}")
+        return
+
+    cfg = load_config()
+    if not cfg.get("enabled", True):
+        sys.stdout.write("{}")
+        return
+
+    conv_id = str(payload.get("conversationId") or "").strip()
+    transcript_path = str(payload.get("transcriptPath") or "").strip()
+    model_output = str(payload.get("modelOutput") or "")
+
+    state = load_conv_state(conv_id)
+    steps = parse_transcript(transcript_path)
+    if not steps:
+        sys.stdout.write("{}")
+        return
+
+    last_step = steps[-1]
+    is_final_planner_step = (
+        last_step.get("type") == "PLANNER_RESPONSE"
+        and not last_step.get("tool_calls")
+    )
+    if not is_final_planner_step:
+        sys.stdout.write("{}")
+        return
+
+    used_pct, latest_step_idx, last_checkpoint_step_idx = get_context_usage_info(
+        conv_id, steps, state
+    )
+    suggest_thresholds = cfg.get("suggestThresholdsPct", DEFAULT_SUGGEST_THRESHOLDS)
+    force_pct = float(cfg.get("forceThresholdPct", DEFAULT_FORCE_THRESHOLD_PCT))
+    status = state.get("status", "idle")
+    first_suggest_step_idx = int(
+        state.get("first_suggest_step_idx", state.get("trigger_step_idx", -1))
+    )
+    trigger_step_idx = int(state.get("trigger_step_idx", -1))
+    last_suggested_tier = float(state.get("last_suggested_tier", 0.0))
+
+    # If a built-in or manual compaction happened after our suggestion, reset state to idle
+    if status in ("suggested", "wrapping_forced") and last_checkpoint_step_idx > first_suggest_step_idx:
+        state["status"] = "idle"
+        state["last_suggested_tier"] = 0.0
+        save_conv_state(conv_id, state)
+        status = "idle"
+        last_suggested_tier = 0.0
+
+    # 1. If in "suggested" or "wrapping_forced", check if `session-wrap` just completed!
+    if status in ("suggested", "wrapping_forced"):
+        check_since = trigger_step_idx if status == "wrapping_forced" else first_suggest_step_idx
+        if check_since >= 0:
+            progress = analyze_wrap_progress(steps, check_since, model_output=model_output)
+            if progress["wrap_completed"]:
+                trigger_pct = state.get("trigger_pct", round(used_pct, 1))
+                _emit_compaction_checkpoint(
+                    conv_id=conv_id,
+                    state=state,
+                    steps=steps,
+                    latest_step_idx=latest_step_idx,
+                    last_checkpoint_step_idx=last_checkpoint_step_idx,
+                    since_step_idx=check_since,
+                    trigger_pct=trigger_pct,
+                )
+                return
+
+    # If currently in 90% forced wrap and not yet completed, let Stop hook handle continuation
+    if status == "wrapping_forced" or used_pct >= force_pct:
+        sys.stdout.write("{}")
+        return
+
+    # 2. Check if context usage has crossed a suggestion tier (60% or 70%)
+    cooldown_until = int(state.get("cooldown_until_step", -1))
+    if latest_step_idx <= cooldown_until or latest_step_idx <= last_checkpoint_step_idx:
+        sys.stdout.write("{}")
+        return
+
+    crossed_tiers = [t for t in suggest_thresholds if used_pct >= t]
+    if not crossed_tiers:
+        sys.stdout.write("{}")
+        return
+
+    current_tier = max(crossed_tiers)
+    if current_tier <= last_suggested_tier:
+        # User already declined at this tier; do neither wrap nor compact until next tier!
+        sys.stdout.write("{}")
+        return
+
+    # If user already manually ran and completed session-wrap on this very turn at >= 60%, compact directly
+    recent_start = max(last_checkpoint_step_idx, latest_step_idx - 20)
+    manual_progress = analyze_wrap_progress(steps, recent_start, model_output=model_output)
+    if manual_progress["wrap_completed"]:
+        _emit_compaction_checkpoint(
+            conv_id=conv_id,
+            state=state,
+            steps=steps,
+            latest_step_idx=latest_step_idx,
+            last_checkpoint_step_idx=last_checkpoint_step_idx,
+            since_step_idx=recent_start,
+            trigger_pct=round(used_pct, 1),
+        )
+        return
+
+    # Record the new suggestion tier (60% -> 70%)
+    if status == "idle" or first_suggest_step_idx < 0:
+        state["first_suggest_step_idx"] = latest_step_idx
+    state["status"] = "suggested"
+    state["trigger_step_idx"] = latest_step_idx
+    state["trigger_pct"] = round(used_pct, 1)
+    state["last_suggested_tier"] = current_tier
+    state["remind_count"] = 0
+    state["triggered_at"] = time.time()
+    save_conv_state(conv_id, state)
+
+    higher_suggest_tiers = [t for t in suggest_thresholds if t > current_tier]
+    if higher_suggest_tiers:
+        next_tier_note = f"re-asks at {higher_suggest_tiers[0]:.0f}% if declined"
+    else:
+        next_tier_note = f"auto-runs wrap & compact at {force_pct:.0f}% if declined"
+
+    is_first_tier = (current_tier == suggest_thresholds[0])
+    tier_label = "1st Suggestion" if is_first_tier else "2nd Suggestion"
+
+    model_msg = WRAP_SUGGESTION_MODEL_MSG_TEMPLATE.format(
+        tier_label=tier_label,
+        tier_pct=current_tier,
+        used_pct=used_pct,
+        next_tier_note=next_tier_note,
+    )
+    if is_first_tier:
+        user_md = WRAP_SUGGESTION_USER_MARKDOWN_60.format(
+            used_pct=used_pct,
+        )
+    else:
+        user_md = WRAP_SUGGESTION_USER_MARKDOWN_70.format(
+            used_pct=used_pct,
+            tier_pct=current_tier,
+            force_pct=force_pct,
+        )
+
+    _log(
+        f"[PostInvocation] Displayed {current_tier:.0f}% session-wrap suggestion at {used_pct:.1f}% "
+        f"(step={latest_step_idx}, conv={conv_id})"
+    )
+    output = {
+        "injectSteps": [
+            {
+                "systemMessage": {
+                    "systemMessage": model_msg,
+                    "metadata": {
+                        "user_markdown": user_md,
+                    },
+                }
+            }
+        ]
+    }
+    sys.stdout.write(json.dumps(output, ensure_ascii=False))
+    sys.stdout.flush()
+
+
 def handle_stop(payload):
     if is_subagent_or_internal(payload):
         sys.stdout.write("{}")
@@ -554,55 +804,56 @@ def handle_stop(payload):
     used_pct, latest_step_idx, last_checkpoint_step_idx = get_context_usage_info(
         conv_id, steps, state
     )
+    force_pct = float(cfg.get("forceThresholdPct", DEFAULT_FORCE_THRESHOLD_PCT))
+    status = state.get("status", "idle")
+    first_suggest_step_idx = int(
+        state.get("first_suggest_step_idx", state.get("trigger_step_idx", -1))
+    )
+    trigger_step_idx = int(state.get("trigger_step_idx", -1))
 
-    # 1. If user canceled or an error terminated the loop during wrap, reset cleanly
+    # 1. If user canceled or error occurred during forced wrap, reset cleanly
     if term_reason in ("USER_CANCELED", "ERROR"):
-        if state.get("status") == "wrapping":
-            state["status"] = "idle"
+        if status == "wrapping_forced":
+            state["status"] = "suggested"
             state["cooldown_until_step"] = latest_step_idx + 6
             save_conv_state(conv_id, state)
-            _log(f"[Stop] Reset wrapping state on {term_reason} (conv={conv_id})")
+            _log(f"[Stop] Reset wrapping_forced on {term_reason} (conv={conv_id})")
         sys.stdout.write("{}")
         return
 
-    # 2. Do not interrupt while background tasks or subagents are still active
+    # 2. Do not interrupt while subagents or background tasks are running
     if not fully_idle or term_reason != "NO_TOOL_CALL":
         sys.stdout.write("{}")
         return
 
-    threshold_pct = float(cfg.get("thresholdPct", DEFAULT_WRAP_THRESHOLD_PCT))
-    status = state.get("status", "idle")
+    # 3. If a checkpoint occurred after our suggestion/trigger, reset to idle
+    if status in ("suggested", "wrapping_forced") and last_checkpoint_step_idx > max(first_suggest_step_idx, trigger_step_idx) >= 0:
+        state["status"] = "idle"
+        state["last_suggested_tier"] = 0.0
+        save_conv_state(conv_id, state)
+        status = "idle"
 
-    # 3. If currently in "wrapping" state, check why Stop was reached
-    if status == "wrapping":
-        trigger_step_idx = int(state.get("trigger_step_idx", -1))
-        progress = analyze_wrap_progress(steps, trigger_step_idx)
-
-        # Safety bound: if too many steps elapsed or checkpoint already occurred after trigger
-        if (
-            last_checkpoint_step_idx > trigger_step_idx
-            or (latest_step_idx - trigger_step_idx) > MAX_WRAP_STEPS
-        ):
+    # 4. If currently in 90% forced wrap ("wrapping_forced"), handle completion / reminder
+    if status == "wrapping_forced":
+        if (latest_step_idx - trigger_step_idx) > MAX_WRAP_STEPS:
             state["status"] = "idle"
             state["cooldown_until_step"] = latest_step_idx + 6
             save_conv_state(conv_id, state)
-            _log(f"[Stop] Wrap expired or already compacted (conv={conv_id})")
             sys.stdout.write("{}")
             return
 
+        progress = analyze_wrap_progress(steps, trigger_step_idx)
         # If the agent printed the report in plain text without calling `ask_question`,
-        # let it stop so the user can reply in the next turn.
+        # allow stop so the user can reply in chat.
         if progress["has_wrap_report"] and progress["ask_question_step_idx"] < 0:
-            _log(f"[Stop] Wrap report printed without ask_question; waiting for user reply (conv={conv_id})")
             sys.stdout.write("{}")
             return
 
-        # If the agent stopped before even producing the report/ask_question, remind it once
         remind_count = int(state.get("remind_count", 0))
         if not progress["has_wrap_report"] and progress["ask_question_step_idx"] < 0 and remind_count < 1:
             state["remind_count"] = remind_count + 1
             save_conv_state(conv_id, state)
-            _log(f"[Stop] Reminding agent to complete session-wrap (conv={conv_id})")
+            _log(f"[Stop] Reminding agent to complete 90% forced session-wrap (conv={conv_id})")
             sys.stdout.write(
                 json.dumps(
                     {
@@ -614,32 +865,57 @@ def handle_stop(payload):
             )
             return
 
-        # Otherwise allow stop
         sys.stdout.write("{}")
         return
 
-    # 4. In "idle" state: check if context usage has reached >= threshold_pct (50%)
+    # 5. If in "suggested" state and user accepted (subagents already started), remind once if stopped early
+    if status == "suggested" and trigger_step_idx >= 0:
+        progress = analyze_wrap_progress(steps, trigger_step_idx)
+        remind_count = int(state.get("remind_count", 0))
+        if (
+            progress["last_subagent_step_idx"] > trigger_step_idx
+            and not progress["has_wrap_report"]
+            and progress["ask_question_step_idx"] < 0
+            and remind_count < 1
+        ):
+            state["remind_count"] = remind_count + 1
+            save_conv_state(conv_id, state)
+            _log(f"[Stop] Reminding agent to finish user-accepted session-wrap (conv={conv_id})")
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "decision": "continue",
+                        "reason": WRAP_REMINDER_PROMPT,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return
+
+    # 6. 90% Forced Auto-Wrap & Auto-Compact trigger!
     cooldown_until = int(state.get("cooldown_until_step", -1))
     if latest_step_idx <= cooldown_until or latest_step_idx <= last_checkpoint_step_idx:
         sys.stdout.write("{}")
         return
 
-    if used_pct >= threshold_pct:
-        # Transition to "wrapping" and instruct the agent to run interactive session-wrap
-        state["status"] = "wrapping"
+    if used_pct >= force_pct:
+        if status == "idle" or first_suggest_step_idx < 0:
+            state["first_suggest_step_idx"] = latest_step_idx
+        state["status"] = "wrapping_forced"
         state["trigger_step_idx"] = latest_step_idx
-        state["trigger_pct"] = round(used_pct, 2)
+        state["trigger_pct"] = round(used_pct, 1)
+        state["last_suggested_tier"] = force_pct
         state["remind_count"] = 0
         state["triggered_at"] = time.time()
         save_conv_state(conv_id, state)
 
-        prompt = WRAP_TRIGGER_PROMPT_TEMPLATE.format(
+        prompt = FORCE_WRAP_90_PROMPT_TEMPLATE.format(
             used_pct=used_pct,
-            threshold_pct=threshold_pct,
+            force_pct=force_pct,
         )
         _log(
-            f"[Stop] Triggered Pre-Compact Session Wrap at {used_pct:.1f}% "
-            f"(threshold={threshold_pct:.1f}%, step={latest_step_idx}, conv={conv_id})"
+            f"[Stop] Triggered 90% Forced Auto-Wrap at {used_pct:.1f}% "
+            f"(force_pct={force_pct:.1f}%, step={latest_step_idx}, conv={conv_id})"
         )
         sys.stdout.write(
             json.dumps(
@@ -655,85 +931,6 @@ def handle_stop(payload):
     sys.stdout.write("{}")
 
 
-def handle_post_invocation(payload):
-    if is_subagent_or_internal(payload):
-        sys.stdout.write("{}")
-        return
-
-    conv_id = str(payload.get("conversationId") or "").strip()
-    state = load_conv_state(conv_id)
-
-    # Fast-path (0ms) when not in an active pre-compact wrap
-    if state.get("status") != "wrapping":
-        sys.stdout.write("{}")
-        return
-
-    transcript_path = str(payload.get("transcriptPath") or "").strip()
-    model_output = str(payload.get("modelOutput") or "")
-    steps = parse_transcript(transcript_path)
-    if not steps:
-        sys.stdout.write("{}")
-        return
-
-    trigger_step_idx = int(state.get("trigger_step_idx", -1))
-    progress = analyze_wrap_progress(steps, trigger_step_idx, model_output=model_output)
-
-    if not progress["wrap_completed"]:
-        sys.stdout.write("{}")
-        return
-
-    # Interactive session-wrap and user-selected actions are complete!
-    # Build the checkpoint summary and immediately inject a CortexStepCheckpoint.
-    _, latest_step_idx, last_checkpoint_step_idx = get_context_usage_info(
-        conv_id, steps, state
-    )
-    session_summary = build_checkpoint_session_summary(
-        steps,
-        last_checkpoint_step_idx=last_checkpoint_step_idx,
-        trigger_step_idx=trigger_step_idx,
-    )
-
-    compacted_step_marker = max(latest_step_idx, progress["last_step_idx"]) + 5
-    state["status"] = "idle"
-    state["last_compacted_step_idx"] = compacted_step_marker
-    state["last_compacted_at"] = time.time()
-    state["compaction_count"] = int(state.get("compaction_count", 0)) + 1
-    state["cooldown_until_step"] = compacted_step_marker + 4
-    save_conv_state(conv_id, state)
-
-    mark_hud_snapshot_compacted(conv_id, compacted_step_marker)
-
-    trigger_pct = state.get("trigger_pct", DEFAULT_WRAP_THRESHOLD_PCT)
-    _log(
-        f"[PostInvocation] Injected checkpoint compaction after session-wrap "
-        f"(trigger_pct={trigger_pct}%, step={latest_step_idx}, conv={conv_id})"
-    )
-
-    output = {
-        "injectSteps": [
-            {
-                "checkpoint": {
-                    "sessionSummary": session_summary,
-                }
-            },
-            {
-                "systemMessage": {
-                    "systemMessage": "",
-                    "metadata": {
-                        "user_markdown": (
-                            f"\n> 🗜️ **[Auto Pre-Compact Wrap 완료]** "
-                            f"`session-wrap` 마무리 작업 반영 후 컨텍스트 컴팩션(Checkpoint)이 "
-                            f"자동 실행되었습니다 (트리거 시점: `{trigger_pct}%`).\n"
-                        ),
-                    },
-                }
-            },
-        ]
-    }
-    sys.stdout.write(json.dumps(output, ensure_ascii=False))
-    sys.stdout.flush()
-
-
 def handle_cli_status(args):
     cfg = load_config()
     if args.enable:
@@ -742,8 +939,8 @@ def handle_cli_status(args):
     elif args.disable:
         cfg["enabled"] = False
         _atomic_write_json(CONFIG_PATH, cfg)
-    if args.threshold is not None:
-        cfg["thresholdPct"] = float(args.threshold)
+    if args.force_threshold is not None:
+        cfg["forceThresholdPct"] = float(args.force_threshold)
         _atomic_write_json(CONFIG_PATH, cfg)
 
     print(json.dumps(cfg, indent=2, ensure_ascii=False))
@@ -760,7 +957,7 @@ def main():
         parser.add_argument("cmd")
         parser.add_argument("--enable", action="store_true")
         parser.add_argument("--disable", action="store_true")
-        parser.add_argument("--threshold", type=float, default=None)
+        parser.add_argument("--force-threshold", type=float, default=None)
         args = parser.parse_args()
         handle_cli_status(args)
         return
